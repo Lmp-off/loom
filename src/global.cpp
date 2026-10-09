@@ -1,9 +1,11 @@
 #include "global.h"
 
 std::atomic<bool> g_running{true};
-std::atomic<bool> g_initialized{false};
+std::atomic<uint32_t> g_flags{FLAG_RUNNING};
+std::chrono::steady_clock::time_point g_last_heartbeat = std::chrono::steady_clock::now();
 
-void init_globals() {
-    g_running = true;
-    g_initialized = true;
-}
+// Для логирования отправки/получения
+std::string g_last_sender;
+std::string g_last_receiver;
+std::string g_last_message;
+std::atomic<bool> g_message_received{false};
