@@ -4,6 +4,9 @@
 
 namespace gwp {
 
+static constexpr uint32_t MAX_METHOD_LEN = 4096;
+static constexpr uint32_t MAX_DATA_LEN   = 16 * 1024 * 1024;
+
 void GWPPacket::set_method(const std::string& method) {
     method_name_ = method;
     header_.method_name_len = method.length();
@@ -48,35 +51,42 @@ std::vector<uint8_t> GWPPacket::make_package() const {
 
 bool GWPPacket::deserialize(const uint8_t* buffer, size_t len) {
     if (len < sizeof(GWPHeader)) return false;
-    
-    memcpy(&header_, buffer, sizeof(GWPHeader));
-    
-    header_.magic = ntohl(header_.magic);
-    if (header_.magic != 0x4757505F) return false;
-    
-    header_.packet_id = ntohl(header_.packet_id);
-    header_.method_name_len = ntohl(header_.method_name_len);
-    header_.data_len = ntohl(header_.data_len);
-    
-    size_t expected_size = sizeof(GWPHeader) + header_.method_name_len + header_.data_len;
+
+    GWPHeader h;
+    memcpy(&h, buffer, sizeof(GWPHeader));
+
+    h.magic = ntohl(h.magic);
+    if (h.magic != 0x4757505F) return false;
+
+    h.packet_id       = ntohl(h.packet_id);
+    h.method_name_len = ntohl(h.method_name_len);
+    h.data_len        = ntohl(h.data_len);
+
+    if (h.method_name_len > MAX_METHOD_LEN) return false;
+    if (h.data_len        > MAX_DATA_LEN)   return false;
+
+    size_t expected_size = sizeof(GWPHeader) + h.method_name_len + h.data_len;
     if (len < expected_size) return false;
-    
+
+    header_ = h;
+
     size_t offset = sizeof(GWPHeader);
-    
-    if (header_.method_name_len > 0) {
-        method_name_.assign(reinterpret_cast<const char*>(buffer + offset), header_.method_name_len);
-        offset += header_.method_name_len;
+
+    if (h.method_name_len > 0) {
+        method_name_.assign(reinterpret_cast<const char*>(buffer + offset),
+                            h.method_name_len);
+        offset += h.method_name_len;
     } else {
         method_name_.clear();
     }
-    
-    if (header_.data_len > 0) {
-        data_.resize(header_.data_len);
-        memcpy(data_.data(), buffer + offset, header_.data_len);
+
+    if (h.data_len > 0) {
+        data_.resize(h.data_len);
+        memcpy(data_.data(), buffer + offset, h.data_len);
     } else {
         data_.clear();
     }
-    
+
     return true;
 }
 
