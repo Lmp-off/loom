@@ -1,19 +1,20 @@
 #include "strategy.hpp"
+
 #include "../worker/worker.hpp"
-#include "../buffer/buffer.hpp"
 
-#include <memory>
-#include <atomic>
+size_t RoundRobinStrategy::dispatch(
+    const IncomingPacket&,
+    const std::vector<std::unique_ptr<Worker>>& workers) {
+    const size_t count = workers.size();
+    if (count == 0) return npos;
 
-class RoundRobinStrategy : public DistributionStrategy {
-public:
-    size_t dispatch(const IncomingPacket&,
-                    const std::vector<std::unique_ptr<Worker>>& workers) override {
-        if (workers.empty()) return 0;
-        size_t idx = counter_.fetch_add(1, std::memory_order_relaxed);
-        return idx % workers.size();
+    const size_t start = counter_.fetch_add(1, std::memory_order_relaxed);
+    for (size_t offset = 0; offset < count; ++offset) {
+        const size_t index = (start + offset) % count;
+        if (workers[index] && workers[index]->is_free()) {
+            return index;
+        }
     }
 
-private:
-    std::atomic<size_t> counter_{0};
-};
+    return npos;
+}
