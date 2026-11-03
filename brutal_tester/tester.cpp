@@ -13,7 +13,7 @@ struct TestFlags {
     std::vector<std::string> only;
 };
 
-TestFlags g_flags;
+TestFlags g_test_flags;
 
 struct TestCase {
     std::string name;
@@ -35,6 +35,9 @@ int test_uds_all();
 int test_jit_all();
 int test_connect_all();
 int test_send_recv_all();
+int test_tdb_all();
+int test_transport_all();
+int test_rpc_all();
 
 void register_all_tests() {
     g_tests.push_back({"cache:all", "cache", test_cache_all});
@@ -43,6 +46,9 @@ void register_all_tests() {
     g_tests.push_back({"jit:all", "jit", test_jit_all});
     g_tests.push_back({"connect:all", "connect", test_connect_all});
     g_tests.push_back({"send_recv:all", "send_recv", test_send_recv_all});
+    g_tests.push_back({"tdb:all", "tdb", test_tdb_all});
+    g_tests.push_back({"transport:all", "transport", test_transport_all});
+    g_tests.push_back({"rpc:all", "rpc", test_rpc_all});
 }
 
 void print_usage() {
@@ -70,16 +76,16 @@ bool parse_args(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "-all") g_flags.all = true;
-        else if (arg == "-list") g_flags.list = true;
-        else if (arg == "-v" || arg == "--verbose") g_flags.verbose = true;
-        else if (arg == "-skip" && i + 1 < argc) g_flags.skip.push_back(argv[++i]);
-        else if (arg == "-only" && i + 1 < argc) g_flags.only.push_back(argv[++i]);
+        if (arg == "-all") g_test_flags.all = true;
+        else if (arg == "-list") g_test_flags.list = true;
+        else if (arg == "-v" || arg == "--verbose") g_test_flags.verbose = true;
+        else if (arg == "-skip" && i + 1 < argc) g_test_flags.skip.push_back(argv[++i]);
+        else if (arg == "-only" && i + 1 < argc) g_test_flags.only.push_back(argv[++i]);
         else if (arg == "-h" || arg == "--help") { print_usage(); return false; }
         else { std::cerr << "Unknown flag: " << arg << std::endl; print_usage(); return false; }
     }
 
-    if (!g_flags.all && g_flags.only.empty() && !g_flags.list) {
+    if (!g_test_flags.all && g_test_flags.only.empty() && !g_test_flags.list) {
         print_usage();
         return false;
     }
@@ -88,16 +94,16 @@ bool parse_args(int argc, char* argv[]) {
 
 void apply_filters() {
     for (auto& test : g_tests) {
-        if (!g_flags.only.empty()) {
+        if (!g_test_flags.only.empty()) {
             bool found = false;
-            for (const auto& name : g_flags.only) {
+            for (const auto& name : g_test_flags.only) {
                 if (test.name.find(name) != std::string::npos || test.group == name) {
                     found = true; break;
                 }
             }
             if (!found) test.enabled = false;
         }
-        for (const auto& name : g_flags.skip) {
+        for (const auto& name : g_test_flags.skip) {
             if (test.name.find(name) != std::string::npos || test.group == name) {
                 test.enabled = false;
             }
@@ -124,7 +130,7 @@ int run_tests() {
     for (auto& test : g_tests) {
         if (!test.enabled) {
             g_skipped++;
-            if (g_flags.verbose) std::cout << "[ SKIP ] " << test.name << "\n";
+            if (g_test_flags.verbose) std::cout << "[ SKIP ] " << test.name << "\n";
             continue;
         }
 
@@ -152,7 +158,7 @@ int run_tests() {
 int main(int argc, char* argv[]) {
     register_all_tests();
     if (!parse_args(argc, argv)) return 1;
-    if (g_flags.list) { list_tests(); return 0; }
+    if (g_test_flags.list) { list_tests(); return 0; }
     apply_filters();
     return run_tests();
 }
