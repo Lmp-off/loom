@@ -18,8 +18,21 @@ set(SOURCES
     src/discovery/capabilities.cpp
     src/core/server_core_api.cpp
     src/transport/local/uds.cpp
+    src/transport/link.cpp
+    src/transport/local/uds_transport.cpp
+    src/transport/connection_cache.cpp
+    src/transport/transport_manager.cpp
     src/core/jit_generator.cpp
     src/core/manager.cpp
+    src/core/rpc_codec.cpp
+    src/core/rpc_state.cpp
+    src/protocol/gwp.cpp
+    src/gateway/TDB/buffer/buffer.cpp
+    src/gateway/TDB/strategy/strategy.cpp
+    src/gateway/TDB/worker/worker.cpp
+    src/gateway/TDB/uplink/uplink.cpp
+    src/gateway/TDB/outlink/outlink.cpp
+    src/gateway/TDB/tdb.cpp
     metalogger/metalogger.cpp
     src/global.cpp
 )
@@ -49,6 +62,15 @@ target_link_libraries(loom
     dl
     rt
 )
+
+# ============================================================
+# ПРИМЕРЫ: ДВА МОДУЛЯ
+# ============================================================
+add_executable(loom_calc_server examples/calc_server.cpp)
+target_link_libraries(loom_calc_server loom pthread dl rt)
+
+add_executable(loom_calc_client examples/calc_client.cpp)
+target_link_libraries(loom_calc_client loom pthread dl rt)
 
 # ============================================================
 # BRUTAL TESTER (loom/brutal_tester/)
