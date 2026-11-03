@@ -1,71 +1,53 @@
-// ============================================================================
-//  АРХИТЕКТУРА ОБМЕНА ПАКЕТАМИ
-// ============================================================================
-//
-//  ПОТОК ПАКЕТА (A → B → ответ)
-//  ----------------------------
-//
-//   A: бизнес-логика
-//        │ manager.send_request("B", "process", data)
-//        ▼
-//      Transport (UDS/UDP/TCP)
-//        │ get_cache("B") → endpoint{type, address, port}
-//        │ GWPPacket{method, data}.make_package() → байты
-//        │ send/sendto(endpoint)
-//        │
-//        │  [сеть / UDS]
-//        ▼
-//   B: Transport (UDS/UDP/TCP)
-//        │ accept/recvfrom → fd, addr
-//        │ recv → frame
-//        │ IncomingPacket{ data=move(frame), client_fd, address, type }
-//        ▼
-//      TDB
-//        │ on_packet(move(ip))
-//        │ разбор пакета и вызов бизнес-логики
-//        │
-//        ├─ client_fd >= 0: ответ отправляется обратно через транспорт
-//        └─ client_fd == -1: ответ не требуется
-//
-//
-//  СОСТАВ
-//  ------
-//   GWPPacket        — сериализуемый пакет: method + data + header
-//   IncomingPacket   — принятый пакет: байты кадра + fd + адрес отправителя
-//   Transport        — приём/отправка через сокет, знает только TDB
-//   TDB              — приём пакетов от транспорта, разбор, вызов логики
-//   Cache            — соответствие module_name → endpoint
-//
-//
-//  МОДЕЛИ ОБМЕНА
-//  -------------
-//                                 | Прямой сокет      | Общий пул
-//                                 | (A и B знают др.) | (случайные модули)
-//   ------------------------------|-------------------|------------------
-//   client_fd в IncomingPacket    | fd                | -1
-//   Ответ                         | обратно по fd     | не требуется
-//   Janitor (закрытие fd)         | нужен             | не нужен
-//
-// ============================================================================
-
 #pragma once
-#include "uplink/uplink.hpp"
+
 #include "buffer/buffer.hpp"
+#include "outlink/outlink.hpp"
+#include "uplink/uplink.hpp"
+
+#include <cstddef>
+#include <memory>
+
+// TDB — Task Distribution Block, композиция UPLINK и OUTLINK.
+//
+// Архитектурные инварианты:
+// - входящий путь: Transport -> pass_packet() -> UPLINK::push -> Buffer ->
+//   диспетчер -> Worker -> PacketHandler;
+// - исходящий путь: PacketHandler -> OutgoingSink -> submit_outgoing() ->
+//   OUTLINK -> SendCallback -> TransportManager;
+// - TDB не знает про транспорт, Cache и GWP-семантику;
+// - client_fd входящего пакета всегда -1;
+// - priority-пакеты идут в priority Buffer и priority-очередь OUTLINK.
+//
+// init(): workers — число воркеров UPLINK, senders — число потоков OUTLINK,
+// max_direct_workers — лимит выделенных воркеров priority-модулей
+// (UPLINK::kAutoDirectWorkers — столько же, сколько обычных).
 
 class TDB {
 public:
     TDB();
     ~TDB();
-    
-    bool init(size_t workers, size_t senders);
+
+    TDB(const TDB&) = delete;
+    TDB& operator=(const TDB&) = delete;
+
+    bool init(size_t workers, size_t senders, size_t queue_capacity = 1024,
+              std::unique_ptr<DistributionStrategy> strategy = nullptr,
+              size_t max_direct_workers = UPLINK::kAutoDirectWorkers);
     void shutdown();
 
     void pass_packet(IncomingPacket&& ip);
-    
+    bool submit_outgoing(OutgoingPacket&& op);
+    void set_sender(SendCallback callback);
+    void set_handler(PacketHandler handler);
+
     UPLINK* uplink() { return uplink_.get(); }
-    UPLINK* outlink() { return outlink_.get(); }
-    
+    OUTLINK* outlink() { return outlink_.get(); }
+
+    size_t processed_count() const;
+    size_t invalid_count() const;
+    size_t dropped_count() const;
+
 private:
     std::unique_ptr<UPLINK> uplink_;
-    std::unique_ptr<UPLINK> outlink_;
+    std::unique_ptr<OUTLINK> outlink_;
 };
