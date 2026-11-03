@@ -4,9 +4,6 @@
 
 namespace gwp {
 
-static constexpr uint32_t MAX_METHOD_LEN = 4096;
-static constexpr uint32_t MAX_DATA_LEN   = 16 * 1024 * 1024;
-
 void GWPPacket::set_method(const std::string& method) {
     method_name_ = method;
     header_.method_name_len = method.length();
@@ -49,8 +46,8 @@ std::vector<uint8_t> GWPPacket::make_package() const {
     return package;
 }
 
-bool GWPPacket::deserialize(const uint8_t* buffer, size_t len) {
-    if (len < sizeof(GWPHeader)) return false;
+bool parse_header(const uint8_t* buffer, size_t len, GWPHeader& header) {
+    if (buffer == nullptr || len < sizeof(GWPHeader)) return false;
 
     GWPHeader h;
     memcpy(&h, buffer, sizeof(GWPHeader));
@@ -63,7 +60,15 @@ bool GWPPacket::deserialize(const uint8_t* buffer, size_t len) {
     h.data_len        = ntohl(h.data_len);
 
     if (h.method_name_len > MAX_METHOD_LEN) return false;
-    if (h.data_len        > MAX_DATA_LEN)   return false;
+    if (h.data_len > MAX_DATA_LEN) return false;
+
+    header = h;
+    return true;
+}
+
+bool GWPPacket::deserialize(const uint8_t* buffer, size_t len) {
+    GWPHeader h;
+    if (!parse_header(buffer, len, h)) return false;
 
     size_t expected_size = sizeof(GWPHeader) + h.method_name_len + h.data_len;
     if (len < expected_size) return false;
