@@ -68,13 +68,14 @@
 ```
 API и структура     ████████░░  80%
 JIT-ядро            █████████░  90%
-Транспорт UDS       ████████░░  80%
+Транспорт UDS       █████████░  90%
 Транспорт UDP       ████░░░░░░  40%
 GWP-протокол        ████░░░░░░  45%
-TDB (buffer+uplink) ████░░░░░░  40%
-Discovery           ██░░░░░░░░  20%
-Server Core         ██░░░░░░░░  20%
-RPC Manager         ██░░░░░░░░  25%
+TDB (buffer+dispatch) █████████░  90%
+Priority/direct     ████████░░  80%
+Discovery           ███░░░░░░░  30%
+Server Core         ███░░░░░░░  35%
+RPC Manager         █████░░░░░  50%
 Тестирование        ██████░░░░  60%
 Документация        ██████░░░░  60%
 ```
@@ -86,28 +87,29 @@ RPC Manager         ██░░░░░░░░  25%
 | 1 | **MetaLogger** | `100%` | Уровни, цвета, вкл/выкл |
 | 2 | **Глобальное состояние** | `100%` | `g_running`, `g_flags`, heartbeat через `std::atomic` |
 | 3 | **JIT-адаптеры** | `90%` | Генерация C++, компиляция, `dlopen`, кэш по сигнатуре |
-| 4 | **Публичный C-API** | `80%` | `start`, `stop`, `use_module*`, `module_send`, `register_method` |
-| 5 | **Транспорт UDS** | `80%` | Сокеты, listener-поток, `connect`/`send`, таймауты |
+| 4 | **Публичный C-API** | `90%` | `start`, `stop`, `use_module*`, `use_module_direct_priority`, `module_send`, `register_method`, `loom_call` |
+| 5 | **Транспорт UDS** | `92%` | `Transport`-интерфейс, `UdsTransport`, duplex `Link`, handshake, переиспользование входящих соединений |
 | 6 | **Реестр методов** | `80%` | `ModuleRegistry`, парсинг сигнатур, вызов через адаптер |
-| 7 | **Кэш endpoint'ов** | `60%` | TTL, `get`/`set`; `remove`/`clear` объявлены, но не реализованы |
+| 7 | **Кэш endpoint'ов** | `80%` | TTL, потокобезопасные `get`/`set`/`remove`/`clear` |
+| 8 | **ConnectionCache** | `80%` | Уже принятые UDS-соединения по имени модуля; ответы и встречные запросы без нового `connect()` |
 
 ### 🚧 В работе
 
 | № | Компонент | Готовность | Осталось |
 |:---:|:---|:---:|:---|
 | 8 | **GWP-протокол** | `45%` | Header, packet types, статусы, сериализация; нет версионирования и стриминга |
-| 9 | **TDB (Buffer + UPLINK)** | `40%` | Ring buffer, обёртка UPLINK; воркеры и стратегии — заглушки |
-| 10 | **Brutal Tester** | `60%` | 6 групп тестов, фильтры, тайминги; нет ассертов и unit-фреймворка |
-| 11 | **CMake** | `60%` | Не подключены `capabilities`, `jit`, `server_core`, `global` |
+| 9 | **TDB (Buffer + UPLINK + OUTLINK)** | `92%` | Входной буфер перегрузки + диспетчер/стратегия + пул воркеров, priority-очередь и выделенные direct-воркеры, GWP-разбор, handler → OUTLINK, адресация ответа через UDS-handshake |
+| 10 | **Brutal Tester** | `75%` | 9 групп тестов, фильтры, тайминги; нет ассертов и unit-фреймворка |
+| 11 | **CMake** | `85%` | Подключены TDB, transport, protocol; нет export/package config |
 | 12 | **UDP-транспорт** | `40%` | Приём пакетов, протокол, интеграция с GWP |
-| 13 | **RPC Manager** | `25%` | Интерфейс + `promise`; нет реализации `call`/`on_response`/таймаутов |
-| 14 | **Server Core** | `20%` | Реальный реестр модулей с heartbeat |
+| 13 | **RPC Manager** | `50%` | Минимальный синхронный `call`/response через `rpc_state` + `rpc_codec`; отдельный `worker/rpc_manager` пока не используется |
+| 14 | **Server Core (имитация)** | `35%` | Файловый реестр `module -> endpoint/priority` с `flock`, переживает границы процессов; нет heartbeat, TTL и авторизации |
 
 ### 📋 Не начато
 
 | № | Компонент | Готовность | Требуется |
 |:---:|:---|:---:|:---|
-| 15 | **Worker Pool + стратегии** | `0%` | Реальные воркеры, диспетчеризация, `DistributionStrategy` |
+| 15 | **Worker Pool** | `80%` | Входной буфер перегрузки + стратегия распределения + пул воркеров |
 | 16 | **Дисковый кэш JIT** | `0%` | Сохранение `.so` по хэшу сигнатуры |
 | 17 | **Shared memory** | `0%` | Передача больших payload'ов через fd |
 | 18 | **Трассировка и метрики** | `0%` | Отправка событий в Server Core |
@@ -119,7 +121,7 @@ RPC Manager         ██░░░░░░░░  25%
 
 ### Модуль-сервер
 
-```c
+```cpp
 #include <loom.h>
 
 int add(int a, int b) {
@@ -142,22 +144,52 @@ int main() {
 
 ### Модуль-клиент
 
-```c
+```cpp
 #include <loom.h>
 
 int main() {
     start("app");
-    use_module_direct("calculator");
+    use_module_direct("calculator", true);   // direct/priority путь
 
-    int result = call("calculator", "add", 2, 3);         // 5
-    std::string msg = call("calculator", "greet", "мир"); // "Привет, мир!"
+    int result = loom::call<int>("calculator", "add", 2, 3);          // 5
+    std::string msg =
+        loom::call<std::string>("calculator", "greet", "мир");        // "Привет, мир!"
 }
 ```
+
+`use_module_direct(name, true)` помечает модуль как direct/priority:
+пакеты идут в приоритетную очередь TDB, а принимающая сторона создаёт
+для соединения выделенный Worker (если лимит позволяет). Без второго
+аргумента или с `false` используется обычный общий пул.
+
+`loom::call` — C++-обёртка над C-функцией `loom_call`. Для C/других языков
+аргументы передаются как массив `const void*`, а сигнатура — строкой:
+
+```c
+const void* args[] = { &a, &b };
+int result = 0;
+loom_call("calculator", "add", "int,int->int", args, &result, 5000);
+```
+
+Поддерживаемые типы минимального кодека: `int`, `double`, `float`, `bool`,
+`string`, `void`. Для `string` в `loom_call` пока используется `std::string`
+(C++); C-биндинги для строк появятся позже.
 
 ### Обмен сообщениями
 
 ```c
 module_send("logger", "пользователь вошёл в систему");
+```
+
+`module_send` — односторонний вызов метода `message` с одним строковым
+аргументом. Ответ не ожидается.
+
+### Готовый пример из двух процессов
+
+```bash
+cmake -S . -B build && cmake --build build -j
+./build/loom_calc_server      # терминал 1
+./build/loom_calc_client      # терминал 2
 ```
 
 ---
@@ -186,9 +218,11 @@ module_send("logger", "пользователь вошёл в систему");
                                         │       TDB         │
                                         │  ┌────────────┐   │
                                         │  │   Buffer   │   │
+                                        │  │ (overload) │   │
                                         │  └─────┬──────┘   │
                                         │  ┌─────▼──────┐   │
                                         │  │   UPLINK   │   │
+                                        │  │ dispatcher │   │
                                         │  └─────┬──────┘   │
                                         │  ┌─────▼──────┐   │
                                         │  │  Workers   │   │
@@ -209,9 +243,28 @@ module_send("logger", "пользователь вошёл в систему");
 | 🔍 **Discovery** | Поиск модулей, кэш endpoint'ов с TTL |
 | 🚚 **Transport** | UDS для локальной связи, UDP для сетевой |
 | 📦 **GWP** | Бинарный wire-протокол: header, типы пакетов, статусы |
-| ⚙️ **TDB** | Приём, буферизация и распределение входящих задач между воркерами |
+| ⚙️ **TDB** | Приём, общая буферизация и распределение входящих задач между воркерами |
 | ⚡ **JIT-адаптеры** | Генерация C++ обёрток для **приёма** вызовов по строковой сигнатуре |
 | 📋 **ModuleRegistry** | Хранит методы модуля + адаптеры, вызывает их |
+| 🔌 **LinkManager** | Пул исходящих соединений: переиспользует UDS fd между отправками |
+| ♻️ **ConnectionCache** | Реестр уже принятых входящих соединений по имени модуля: ответы и встречные запросы идут по тому же fd |
+| ⚡ **Priority path** | direct-модули: priority-очереди в UPLINK/OUTLINK + выделенный Worker на соединение, с fallback на общий пул |
+
+---
+
+## 🔄 Java Core Integration
+
+**Java Core** — центральный реестр модулей, предоставляющий API для поиска endpoint'ов:
+
+- `GET /get_core` → возвращает список доступных модулей с их адресами
+- Модули регистрируются при старте через `start()` → `register_module()`
+- Loom использует кэш Discovery для прямой связи между модулями без участия Core
+
+**Принцип работы:**
+1. Java Core ищет модуль по ID/описанию в своём реестре
+2. Получает endpoint (host:port/socket)
+3. Отправляет задачу через Loom напрямую к модулю
+4. Loom берёт активное соединение из `LinkManager` (или открывает новое) и передаёт данные
 
 ---
 
@@ -264,38 +317,103 @@ struct GWPHeader {
    входящий пакет
         │
         ▼
-   ┌─────────┐      ┌───────────┐      ┌──────────┐
-   │ Buffer  │ ──▶ │ UPLINK    │ ──▶ │ Workers  │
-   │ (ring)  │      │ (dispatch)│      │ (pool)   │
-   └─────────┘      └───────────┘      └──────────┘
+   ┌──────────────────┐    ┌──────────────────┐    ┌──────────┐
+   │ Buffer           │ ─▶ │ UPLINK           │ ─▶ │ Workers  │
+   │ (overload, MPMC) │    │ (dispatcher)     │    │ (pool)   │
+   └──────────────────┘    └──────────────────┘    └──────────┘
 ```
 
 | Подкомпонент | Статус | Описание |
 |:---|:---:|:---|
-| **Buffer** | ✅ Реализован | Lock-free кольцевой буфер на `std::atomic`, push/pop, `has_data` per-slot |
-| **UPLINK** | 🚧 Частично | Инициализация пула воркеров, приём пакетов, счётчики |
-| **Worker** | 📋 Заглушка | `start()` / `stop()` — интерфейс есть, логики нет |
-| **DistributionStrategy** | 📋 Заглушка | Базовый класс без методов |
+| **Buffer** | ✅ Реализован | Входной ограниченный MPMC-буфер перегрузки на алгоритме Vyukov; `push` из транспорта, `pop` только диспетчером |
+| **Priority Buffer** | ✅ Реализован | Отдельный буфер для direct-трафика; диспетчер всегда вычитывает его первым |
+| **UPLINK** | ✅ Реализован | Входные Buffer'ы + `DistributionStrategy` + поток диспетчера + пул воркеров; воркеры не читают Buffer |
+| **Direct Workers** | ✅ Реализован | Лениво создаваемый выделенный Worker на priority-модуль, пока не исчерпан `max_direct_workers` |
+| **Worker** | ✅ Реализован | Один слот задачи, `GWP::deserialize`, проверка кадра, счётчики, `PacketHandler` → `OutgoingSink` |
+| **OUTLINK** | ✅ Реализован | Обычная и priority-очередь + N sender-потоков, отправка через `SendCallback` |
 
 **Ключевые API:**
 
 ```cpp
-class Buffer {
-    bool push(IncomingPacket&& packet);          // от транспорта
-    bool pop(size_t worker_id, IncomingPacket&); // воркером
+class RingBuffer<T> {
+    bool init(size_t capacity);                   // округляет до степени двойки
+    bool push(T&& packet);                        // false, если очередь полна
+    bool pop(T& packet);                          // false, если очередь пуста
     size_t size() const;
     bool full() const;
 };
 
+class DistributionStrategy {
+    virtual size_t dispatch(const IncomingPacket& packet,
+                            const std::vector<std::unique_ptr<Worker>>& workers) = 0;
+};
+
 class UPLINK {
-    bool init(size_t workers, DistributionStrategy*);
-    void push(IncomingPacket&& packet);
-    size_t queue_size() const;
-    size_t workers_count() const;
+    bool init(size_t workers, size_t queue_capacity = 1024,
+              std::unique_ptr<DistributionStrategy> strategy = nullptr,
+              size_t max_direct_workers = kAutoDirectWorkers);
+    void push(IncomingPacket&& packet);           // priority -> priority Buffer
+    size_t processed_count() const;
+    size_t worker_processed(size_t index) const;
+    size_t direct_workers_count() const;
+    size_t direct_worker_processed(const std::string& module) const;
+};
+
+class TDB {
+    bool init(size_t workers, size_t senders, size_t queue_capacity = 1024,
+              std::unique_ptr<DistributionStrategy> strategy = nullptr,
+              size_t max_direct_workers = UPLINK::kAutoDirectWorkers);
+    void pass_packet(IncomingPacket&& ip);        // вход от транспорта
+    bool submit_outgoing(OutgoingPacket&& op);    // выход к транспорту
+    void set_sender(SendCallback callback);
+    void set_handler(PacketHandler handler);      // бизнес-логика воркера
 };
 ```
 
-Обеспечивает **изоляцию транспорта от обработки**: транспорт только кладёт пакеты в очередь, воркеры — забирают.
+`max_direct_workers == kAutoDirectWorkers` означает «столько же, сколько
+обычных воркеров»; `0` полностью отключает выделенные воркеры. Если
+выделенного воркера нет или он занят, priority-пакет берёт свободный
+воркер общего пула, но диспетчер всё равно разбирает priority Buffer
+первым. Это даёт ускорение без изменения базовой архитектуры
+Buffer → UPLINK → Worker.
+
+Обеспечивает **изоляцию транспорта от обработки**: транспорт кладёт пакеты во входной Buffer, диспетчер раздаёт их свободным воркерам, а воркеры не читают Buffer.
+
+---
+
+### 🔌 LinkManager и ConnectionCache — переиспользование соединений
+
+`LinkManager` определён в `src/transport/link.hpp` / `link.cpp`. Устроен как
+`Cache`: `get_link_manager()` возвращает глобальный пул, а
+`acquire(module, endpoint)` — существующий `Link` или открывает новое
+соединение.
+
+- `send(module, endpoint, frame)` переиспользует fd вместо `connect → send → close` на каждый кадр.
+- `Link` дуплексный: отдельный reader-поток читает встречные кадры с того же fd и отдаёт их в TDB.
+- При ошибке отправки Link выбрасывается и один раз переподключается.
+- Если endpoint'а нет в Cache, `TransportManager` спрашивает ядро (`server_api::locate`) и сохраняет результат в Cache.
+- `prune_idle(seconds)` и `close_all()` — заготовка под будущий janitor и корректную остановку.
+
+`ConnectionCache` (`src/transport/connection_cache.hpp` / `.cpp`) — реестр
+уже принятых входящих UDS-соединений по имени модуля из handshake.
+
+- `UdsTransport::client_loop` регистрирует принятое соединение в `ConnectionCache`.
+- `TransportManager::send_outgoing` и `send_request` сначала пытаются отправить кадр по уже открытому входящему fd.
+- Ответ на запрос уходит по тому же соединению, без нового `connect()`.
+- Для нового запроса соединение переиспользуется только при совпадении priority-режима; ответы переиспользуются всегда.
+- `client_fd` в `IncomingPacket` по-прежнему `-1`: fd остаётся во владении транспорта.
+
+### ⚡ Direct/priority соединения
+
+`use_module_direct_priority(name, priority)` (C) и
+`use_module_direct(name, bool)` (C++) помечают модуль как direct/priority.
+
+- Handshake нового соединения несёт флаг priority (`src/transport/handshake.hpp`).
+- Принимающая сторона помечает `IncomingPacket::priority` и кладёт пакет в priority Buffer.
+- Для priority-модуля UPLINK лениво создаёт выделенный Worker, пока не исчерпан `max_direct_workers`.
+- Если выделенного Worker нет, задачу берёт общий пул; диспетчер всё равно сначала разбирает priority Buffer.
+- Ответ наследует priority и отправляется через priority-очередь OUTLINK.
+- Смена режима инвалидирует существующий `Link`, чтобы handshake был отправлен заново.
 
 ---
 
@@ -319,8 +437,11 @@ class UPLINK {
 | `module` | `ModuleRegistry`, регистрация методов, вызов |
 | `uds` | Создание сокета, connect, send/recv |
 | `jit` | Генерация адаптера + вызов `int,int->int` |
-| `connect` | `locate` + сохранение в кэш |
+| `connect` | `locate`, fallback, реестр имитации ядра, priority, handshake |
 | `send_recv` | Полный цикл: кэш → listener → send → stop |
+| `tdb` | Buffer MPMC, диспетчер и стратегия, один слот воркера, GWP-разбор, OUTLINK, handler, priority-воркеры и fallback |
+| `transport` | `TransportManager`, резолв Cache/ядра, `LinkManager`, UDS roundtrip, переиспользование входящего соединения |
+| `rpc` | Сквозной вызов между двумя процессами, `loom_call`, priority/direct режим |
 
 Каждый тест возвращает `int` (`0` = успех), раннер замеряет длительность и выводит сводку.
 
@@ -410,12 +531,15 @@ int main() {
 
 - [x] GWP-протокол: header, типы пакетов, статусы — `████░░░░░░` 45%
 - [ ] Server Core с heartbeat — `██░░░░░░░░` 20%
-- [ ] Удалённый вызов методов `call(...)` — `██░░░░░░░░` 25%
+- [x] Удалённый вызов методов `loom::call` / `loom_call` — `█████░░░░░` 50%
 - [ ] Приведение CMake в порядок — `██████░░░░` 60%
 
 ### v0.3 — TDB & Tests
 
-- [ ] Реальные воркеры и стратегии распределения — `░░░░░░░░░░` 0%
+- [x] Входной буфер перегрузки, диспетчер и пул воркеров — `████████░░` 80%
+- [x] TransportManager + UdsTransport — `████████░░` 80%
+- [x] ConnectionCache: переиспользование входящих соединений — `████████░░` 80%
+- [x] Direct/priority путь и выделенные воркеры — `████████░░` 80%
 - [ ] Дисковый кэш JIT-адаптеров — `░░░░░░░░░░` 0%
 - [ ] Приём UDP + интеграция с GWP — `████░░░░░░` 40%
 - [ ] Unit-тесты с ассертами — `░░░░░░░░░░` 0%
