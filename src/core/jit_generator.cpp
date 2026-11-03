@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdint>
 #include <algorithm>
 
 static std::unordered_map<std::string, void*> g_adapter_cache;
@@ -93,7 +94,14 @@ void* jit_get_adapter(const std::string& raw_signature, void* user_func) {
         }
     }
 
-    auto it = g_adapter_cache.find(signature);
+    // Один адаптер хранит один user_func. Кэшируем по паре
+    // (signature, user_func), иначе два метода с одинаковой сигнатурой
+    // в одном модуле начали бы вызывать друг друга.
+    const std::string cache_key =
+        signature + "#" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(user_func));
+
+    auto it = g_adapter_cache.find(cache_key);
     if (it != g_adapter_cache.end()) {
         return it->second;
     }
@@ -156,7 +164,7 @@ void* jit_get_adapter(const std::string& raw_signature, void* user_func) {
 
     if (setter && adapter_ptr) {
         setter(user_func);
-        g_adapter_cache[signature] = adapter_ptr;
+        g_adapter_cache[cache_key] = adapter_ptr;
         METALOG_INFO("✅ JIT adapter created for: " + signature);
         return adapter_ptr;
     }
