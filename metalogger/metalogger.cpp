@@ -1,17 +1,20 @@
 #include "metalogger.h"
+#include <atomic>
 #include <iostream>
 #include <ctime>
+#include <mutex>
 
 namespace metalog {
 
-static bool g_logger_active = true;
+static std::atomic<bool> g_logger_active{true};
+static std::mutex g_log_mutex;
 
 void set_logger_active(bool active) {
-    g_logger_active = active;
+    g_logger_active.store(active, std::memory_order_relaxed);
 }
 
 bool is_logger_active() {
-    return g_logger_active;
+    return g_logger_active.load(std::memory_order_relaxed);
 }
 
 const char* get_level_name(log_level lv) {
@@ -37,13 +40,15 @@ const char* get_color(log_level lv) {
 }
 
 void write_log(const std::string& s, log_level lv) {
-    if (!g_logger_active) return;
+    if (!is_logger_active()) return;
     
     time_t now = time(nullptr);
-    struct tm* tm_info = localtime(&now);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
     char time_buf[20];
-    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", tm_info);
+    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tm_info);
     
+    std::lock_guard<std::mutex> lock(g_log_mutex);
     std::cout << "[" << time_buf << "] "
               << get_color(lv) << get_level_name(lv) << "\033[0m "
               << s << std::endl;
