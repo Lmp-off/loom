@@ -76,6 +76,15 @@ struct GWPHeader {
     uint32_t data_len;       // длина payload в байтах
 };
 
+constexpr size_t HEADER_SIZE = sizeof(GWPHeader);
+constexpr uint32_t MAX_METHOD_LEN = 4096;
+constexpr uint32_t MAX_DATA_LEN = 16 * 1024 * 1024;
+
+// Читает и валидирует заголовок кадра, не копируя payload.
+// На выходе поля в host-byte-order. Возвращает false при неверном magic,
+// недостаточной длине буфера или превышении лимитов длин.
+bool parse_header(const uint8_t* buffer, size_t len, GWPHeader& header);
+
 // GWPPacket — пакет протокола GWP.
 //
 // Инварианты:
@@ -92,7 +101,8 @@ struct GWPHeader {
 // потоками через std::move.
 class GWPPacket {
 public:
-    GWPPacket() : header_{0} { 
+    GWPPacket() {
+        std::memset(&header_, 0, sizeof(header_));
         header_.magic = 0x4757505F;
     }
     
