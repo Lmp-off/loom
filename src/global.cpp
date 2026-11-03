@@ -1,5 +1,7 @@
 #include "global.h"
 
+std::unique_ptr<TDB> g_tdb;
+
 std::atomic<bool> g_running{true};
 std::atomic<uint32_t> g_flags{FLAG_RUNNING};
 std::chrono::steady_clock::time_point g_last_heartbeat = std::chrono::steady_clock::now();
