@@ -8,6 +8,9 @@ set(TESTER_SOURCES
     tests/test_jit.cpp
     tests/test_connect.cpp
     tests/test_send_recv.cpp
+    tests/test_tdb.cpp
+    tests/test_transport.cpp
+    tests/test_rpc.cpp
 )
 
 add_executable(brutal_tester ${TESTER_SOURCES})
