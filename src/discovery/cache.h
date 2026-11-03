@@ -4,7 +4,8 @@
 
 #include <string>
 #include <chrono>
-#include "map"
+#include <map>
+#include <mutex>
 
 enum connection_type{
     CONNECTION_UDP,
@@ -12,10 +13,10 @@ enum connection_type{
 };
 
 struct endpoint {
-    connection_type type;
+    connection_type type = CONNECTION_UDS;
     std::string address;      // "/tmp/module.sock" или "192.168.1.2"
-    int port;
-    std::chrono::steady_clock::time_point timestamp;
+    int port = 0;
+    std::chrono::steady_clock::time_point timestamp{};
 };
 
 class Cache {
@@ -24,11 +25,14 @@ public:
     void set(const std::string& module, const endpoint& ep);
     bool get(const std::string& module, endpoint& ep);
     int  get_ttl() const;
-    bool is_expired(const endpoint& ep);
+    bool is_expired(const endpoint& ep) const;
     void remove(const std::string& module);
     void clear();
-    
+
 private:
+    bool is_expired_locked(const endpoint& ep) const;
+
+    mutable std::mutex mutex_;
     std::map<std::string, endpoint> data;
     int TTL_SECONDS = 60;
 };
