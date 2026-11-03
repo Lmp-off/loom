@@ -2,7 +2,6 @@
 #include "../core/jit_generator.h"
 #include "../../metalogger/metalogger.h"
 #include <dlfcn.h>
-#include <iostream>
 
 std::unordered_map<std::string, Module> ModuleRegistry::modules_;
 
@@ -51,7 +50,7 @@ void Module::parse_signature(const std::string& sig,
 
 void Module::add_method(const method& method_data) {
     methods_[method_data.name] = method_data;
-    METALOG_INFO("✅ Метод '" + method_data.name + "' добавлен в реестр");
+    METALOG_INFO("Метод '" + method_data.name + "' добавлен в реестр");
 }
 
 const method* Module::get_method(const std::string& name) const {
