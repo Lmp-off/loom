@@ -37,6 +37,7 @@ int test_connect_all();
 int test_send_recv_all();
 int test_tdb_all();
 int test_transport_all();
+int test_rpc_ingress();
 int test_rpc_all();
 
 void register_all_tests() {
@@ -48,6 +49,7 @@ void register_all_tests() {
     g_tests.push_back({"send_recv:all", "send_recv", test_send_recv_all});
     g_tests.push_back({"tdb:all", "tdb", test_tdb_all});
     g_tests.push_back({"transport:all", "transport", test_transport_all});
+    g_tests.push_back({"rpc:ingress", "rpc", test_rpc_ingress});
     g_tests.push_back({"rpc:all", "rpc", test_rpc_all});
 }
 

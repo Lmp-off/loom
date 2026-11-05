@@ -50,7 +50,8 @@ void flush_pending_methods(const std::string& module) {
 }
 
 void send_response(const IncomingPacket& incoming,
-                   gwp::GWPPacket& request,
+                   const std::string& method_name,
+                   loom_rpc::ReplyTo reply_to,
                    const OutgoingSink& sink,
                    gwp::StatusCode status,
                    const std::vector<uint8_t>& data) {
@@ -61,10 +62,11 @@ void send_response(const IncomingPacket& incoming,
 
     gwp::GWPPacket response;
     response.set_type(gwp::PacketType::RESPONSE);
-    response.set_id(request.get_id());
-    response.set_method(request.get_method());
+    response.set_id(gwp::next_packet_id());
+    response.set_method(method_name);
     response.set_status(static_cast<uint8_t>(status));
-    response.set_data(data.empty() ? nullptr : data.data(), data.size());
+    const std::string body = loom_rpc::encode_reply_envelope(reply_to, data);
+    response.set_data(body.data(), body.size());
 
     OutgoingPacket packet;
     packet.module = incoming.client_address;
@@ -92,6 +94,19 @@ void invoke_method(const IncomingPacket& incoming,
                    const OutgoingSink& sink,
                    bool respond) {
     const std::string method_name = request.get_method();
+    const uint8_t* args_data = request.get_data();
+    size_t args_size = request.get_data_size();
+    loom_rpc::ReplyTo reply_to;
+    if (respond) {
+        loom_rpc::ReplyEnvelope envelope;
+        if (!loom_rpc::decode_reply_envelope(args_data, args_size, envelope)) {
+            METALOG_WARNING("loom: invalid RPC request envelope");
+            return;
+        }
+        reply_to = envelope.reply_to;
+        args_data = envelope.data;
+        args_size = envelope.size;
+    }
 
     method target;
     bool found = false;
@@ -108,7 +123,7 @@ void invoke_method(const IncomingPacket& incoming,
     if (!found || target.adapter == nullptr) {
         METALOG_WARNING("loom: method not found: " + method_name);
         if (respond) {
-            send_response(incoming, request, sink,
+            send_response(incoming, method_name, reply_to, sink,
                           gwp::StatusCode::METHOD_NOT_FOUND, {});
         }
         return;
@@ -116,12 +131,10 @@ void invoke_method(const IncomingPacket& incoming,
 
     std::vector<loom_rpc::Value> values;
     if (!loom_rpc::decode_args(target.param_types,
-                               request.get_data(),
-                               request.get_data_size(),
-                               values)) {
+                               args_data, args_size, values)) {
         METALOG_WARNING("loom: invalid arguments for method " + method_name);
         if (respond) {
-            send_response(incoming, request, sink,
+            send_response(incoming, method_name, reply_to, sink,
                           gwp::StatusCode::INVALID_PARAMS, {});
         }
         return;
@@ -145,14 +158,14 @@ void invoke_method(const IncomingPacket& incoming,
     } catch (const std::exception& e) {
         METALOG_ERROR("loom: method " + method_name + " failed: " + e.what());
         if (respond) {
-            send_response(incoming, request, sink,
+            send_response(incoming, method_name, reply_to, sink,
                           gwp::StatusCode::ERROR, {});
         }
         return;
     } catch (...) {
         METALOG_ERROR("loom: method " + method_name + " failed");
         if (respond) {
-            send_response(incoming, request, sink,
+            send_response(incoming, method_name, reply_to, sink,
                           gwp::StatusCode::ERROR, {});
         }
         return;
@@ -161,14 +174,16 @@ void invoke_method(const IncomingPacket& incoming,
     if (!respond) return;
 
     std::vector<uint8_t> payload;
-    if (result.type != "void" &&
-        !loom_rpc::encode_value(result.type, result.data(), payload)) {
-        send_response(incoming, request, sink,
+    if ((result.type != "void" &&
+         !loom_rpc::encode_value(result.type, result.data(), payload)) ||
+        payload.size() > gwp::MAX_DATA_LEN - loom_rpc::REPLY_ENVELOPE_HEADER_SIZE) {
+        send_response(incoming, method_name, reply_to, sink,
                       gwp::StatusCode::ERROR, {});
         return;
     }
 
-    send_response(incoming, request, sink, gwp::StatusCode::OK, payload);
+    send_response(incoming, method_name, reply_to, sink,
+                  gwp::StatusCode::OK, payload);
 }
 
 void loom_packet_handler(const IncomingPacket& incoming,
@@ -181,17 +196,6 @@ void loom_packet_handler(const IncomingPacket& incoming,
         case gwp::PacketType::ASYNC_DATA:
             invoke_method(incoming, packet, sink, false);
             break;
-        case gwp::PacketType::RESPONSE: {
-            std::vector<uint8_t> data;
-            if (packet.get_data_size() != 0) {
-                data.assign(packet.get_data(),
-                            packet.get_data() + packet.get_data_size());
-            }
-            loom_rpc::pending_calls().complete(packet.get_id(),
-                                               packet.get_status(),
-                                               std::move(data));
-            break;
-        }
         default:
             break;
     }
@@ -226,7 +230,7 @@ uint8_t start(const char* module_name) {
 
     loom_event_manager::start_manager();
 
-    g_tdb = std::make_unique<TDB>();
+    g_tdb = std::make_unique<TDB>(loom_rpc::receive_response);
     if (!g_tdb->init(9, 4)) {
         METALOG_ERROR("не удалось инициализировать TDB");
         g_tdb.reset();
@@ -249,19 +253,22 @@ uint8_t start(const char* module_name) {
     }
 
     g_transport_manager->set_tdb(g_tdb.get());
-    if (!g_transport_manager->start_all()) {
-        METALOG_ERROR("не удалось запустить транспорт");
-        g_tdb->shutdown();
-        g_tdb.reset();
-        g_transport_manager.reset();
-        return 1;
-    }
-
     // OUTLINK отправляет готовые кадры через TransportManager.
     g_tdb->set_sender([manager = g_transport_manager.get()](
                           OutgoingPacket&& packet) {
         return manager->send_outgoing(std::move(packet));
     });
+
+    loom_rpc::pending_calls().start();
+    if (!g_transport_manager->start_all()) {
+        METALOG_ERROR("не удалось запустить транспорт");
+        g_transport_manager->stop_all();
+        loom_rpc::pending_calls().shutdown();
+        g_tdb->shutdown();
+        g_tdb.reset();
+        g_transport_manager.reset();
+        return 1;
+    }
 
     METALOG_INFO(std::string("module ") + g_name + " has started");
 
@@ -403,29 +410,24 @@ int loom_call(const char* module, const char* method, const char* signature,
     }
 
     std::vector<uint8_t> payload;
-    if (!loom_rpc::encode_args(params, args, payload)) {
+    if (!loom_rpc::encode_args(params, args, payload) ||
+        payload.size() > gwp::MAX_DATA_LEN - loom_rpc::REPLY_ENVELOPE_HEADER_SIZE) {
         METALOG_ERROR("loom_call: failed to encode arguments");
         return -4;
     }
 
-    std::string body;
-    if (!payload.empty()) {
-        body.assign(reinterpret_cast<const char*>(payload.data()),
-                    payload.size());
-    }
+    loom_rpc::PendingCall pending(loom_rpc::pending_calls());
+    const loom_rpc::ReplyTo reply_to = pending.reply_to();
+    if (!reply_to.valid()) return -2;
 
-    auto& pending = loom_rpc::pending_calls();
-    const uint32_t id = pending.next_id();
-    pending.add(id);
-
-    const int rc = g_transport_manager->send_request(module, method, body, id);
+    const std::string body = loom_rpc::encode_reply_envelope(reply_to, payload);
+    const int rc = g_transport_manager->send_request(module, method, body);
     if (rc < 0) {
-        pending.cancel(id);
         return rc;
     }
 
     loom_rpc::Result response;
-    if (!pending.wait(id, response, timeout_ms)) {
+    if (!pending.wait(response, timeout_ms)) {
         return -5;
     }
 

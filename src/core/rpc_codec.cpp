@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <endian.h>
 #include <limits>
 #include <utility>
 
 namespace loom_rpc {
 
 namespace {
+
+constexpr uint32_t kReplyEnvelopeV1 = 0x4c525001; // "LRP" + версия 1
 
 template <typename T>
 void append_pod(std::vector<uint8_t>& out, const T& value) {
@@ -84,6 +87,44 @@ bool decode_value_at(const std::string& type,
 }
 
 } // namespace
+
+std::string encode_reply_envelope(ReplyTo reply_to,
+                                  const std::vector<uint8_t>& payload) {
+    const uint32_t format = htobe32(kReplyEnvelopeV1);
+    const uint64_t worker_handle = htobe64(reply_to.worker_handle);
+    const uint64_t call_seq = htobe64(reply_to.call_seq);
+
+    std::string encoded;
+    encoded.reserve(REPLY_ENVELOPE_HEADER_SIZE + payload.size());
+    encoded.append(reinterpret_cast<const char*>(&format), sizeof(format));
+    encoded.append(reinterpret_cast<const char*>(&worker_handle),
+                   sizeof(worker_handle));
+    encoded.append(reinterpret_cast<const char*>(&call_seq), sizeof(call_seq));
+    if (!payload.empty()) {
+        encoded.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+    }
+    return encoded;
+}
+
+bool decode_reply_envelope(const uint8_t* data, size_t size,
+                           ReplyEnvelope& envelope) {
+    size_t offset = 0;
+    uint32_t format = 0;
+    uint64_t worker_handle = 0;
+    uint64_t call_seq = 0;
+    if (!read_pod(data, size, offset, format) ||
+        be32toh(format) != kReplyEnvelopeV1 ||
+        !read_pod(data, size, offset, worker_handle) ||
+        !read_pod(data, size, offset, call_seq)) {
+        return false;
+    }
+
+    const ReplyTo reply_to{be64toh(worker_handle), be64toh(call_seq)};
+    if (!reply_to.valid()) return false;
+
+    envelope = {reply_to, data + offset, size - offset};
+    return true;
+}
 
 std::string normalize_type(const std::string& type) {
     std::string lower = type;

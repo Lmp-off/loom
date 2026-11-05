@@ -10,6 +10,7 @@
 ## 1. Владение и ответственность
 
 - TDB — композиция `UPLINK` и `OUTLINK`. В TDB нет логики транспорта, Cache или GWP.
+- Core владеет RPC-конвертом, реестром ожидающих вызовов и входным хуком. TDB вызывает хук перед передачей кадра в `UPLINK`.
 - `UPLINK` владеет:
   - обычным и priority входным `Buffer`;
   - одной `DistributionStrategy`;
@@ -20,7 +21,7 @@
 - Priority `Buffer` — такая же очередь перегрузки, но для direct-трафика; диспетчер всегда читает её первой.
 - Единственный потребитель обоих `Buffer` — диспетчер `UPLINK`.
 - `Worker` не вызывает `Buffer::pop` и не забирает задачи из входных буферов.
-- Диспетчер передаёт каждый пакет ровно одному воркеру по решению `DistributionStrategy` или напрямую выделенному воркеру priority-модуля.
+- Диспетчер передаёт каждый пакет из `Buffer` ровно одному воркеру по решению `DistributionStrategy` или напрямую выделенному воркеру priority-модуля.
 - `Worker` владеет одним слотом задачи, своим потоком, счётчиками и конфигурацией `PacketHandler`/`OutgoingSink`.
 - `OUTLINK` владеет обычной и priority исходящей очередью и пулом отправителей.
 - `TransportManager` только роутит по `endpoint.type`; сначала пробует `ConnectionCache`.
@@ -33,7 +34,7 @@
 
 ## 2. Входной буфер и распределение
 
-- Транспорт вызывает `UPLINK::push`, пакет попадает в ограниченный входной `Buffer`.
+- Транспорт вызывает `TDB::pass_packet`. Кадры, оставленные входным хуком, идут через `UPLINK::push` в ограниченный `Buffer`.
 - `Buffer` сглаживает всплески и защищает модуль от перегрузки.
 - Если `Buffer` полон, `UPLINK::push` отбрасывает пакет и увеличивает счётчик `dropped`.
 - Диспетчер — единственный потребитель `Buffer`: `pop` → `DistributionStrategy::dispatch` → `Worker::try_submit`.
@@ -60,28 +61,20 @@
 
 ## 3. Входящий путь
 
-```text
-Transport::accept
-  -> IncomingPacket{data, client_fd = -1, client_address = peer_module}
-  -> TDB::pass_packet
-  -> UPLINK::push
-  -> входной Buffer перегрузки
-
-Диспетчер UPLINK:
-  -> Buffer::pop
-  -> DistributionStrategy::dispatch
-  -> Worker::try_submit
-
-Worker:
-  -> ожидание задачи в своём слоте
-  -> GWPPacket::deserialize
-  -> PacketHandler
-  -> OutgoingSink
+```mermaid
+flowchart TD
+    Reader["UdsTransport или Link reader"] --> Ingress["TDB::pass_packet"]
+    Ingress --> Hook["RPC-хук Core"]
+    Hook -->|RESPONSE| Pending["PendingCalls::try_complete"]
+    Hook -->|Задача| Buffer["UPLINK::push и Buffer"]
+    Buffer --> Dispatch["Диспетчер UPLINK"]
+    Dispatch --> Worker["Worker и PacketHandler"]
 ```
 
-Правила:
+### Транспорт и распределение
 
-- Транспорт читает кадры и не парсит GWP.
+- Транспорт использует `parse_header` для определения длины кадра. RPC-семантика принадлежит Core.
+- Оба UDS-пути, `UdsTransport::client_loop` и `Link::reader_loop`, передают полный `IncomingPacket` в `TDB::pass_packet`.
 - Транспорт передаёт `client_fd = -1`.
 - UDS `client_loop` читает несколько кадров с одного принятого fd.
 - Принятый fd остаётся у транспорта и закрывается при ошибке, EOF или остановке транспорта.
@@ -93,6 +86,15 @@ Worker:
 - Worker не вызывает `Buffer::pop`; он принимает задачу через `try_submit`.
 - Worker никогда не вызывает транспорт напрямую.
 - Worker возвращает ответ только через `OutgoingSink`.
+
+### Доставка ответа
+
+- Core устанавливает `receive_response` как `TDB::IngressHandler`. Хук возвращает `true` для обработанного `RESPONSE`. Запросы идут в `UPLINK`, воркер десериализует GWP и вызывает `PacketHandler`.
+- `REQUEST` и `RESPONSE` несут `reply_to` в RPC-конверте `GWP.data`. Формат `LRP/1` включает четырёхбайтовую метку `4c 52 50 01`, затем `worker_handle` и `call_seq` по 64 бита в big-endian. Остаток конверта — аргументы или результат. `ASYNC_DATA` содержит только аргументы.
+- Перед отправкой `loom_call()` регистрирует `PendingCall` в реестре Core. `worker_handle` — числовой дескриптор вызывающего потока, а `call_seq` растёт с каждым его вызовом. Это покрывает воркеры и обычные потоки приложения.
+- Получатель запроса переносит `reply_to` в ответ. Обратный маршрут определяется по `IncomingPacket::client_address`.
+- На стороне вызывающего модуля `try_complete()` под мьютексом находит запись по `worker_handle` и проверяет `call_seq` и состояние ожидания. При совпадении записывает результат и будит поток через его условную переменную. Просроченные и повторные ответы поглощает тот же хук.
+- Тайм-аут использует тот же мьютекс и помечает вызов завершённым. Объект `PendingCall` удаляет запись при выходе из `loom_call()`, в том числе при ошибке отправки.
 
 ---
 
@@ -119,6 +121,7 @@ PacketHandler
 Правила:
 
 - `PacketHandler` формирует `OutgoingPacket.module` из `IncomingPacket::client_address` (имя отправителя, полученное из UDS-handshake).
+- `packet_id` берётся из счётчика исходящих кадров текущего процесса. Запрос и ответ выделяют его независимо от `reply_to`.
 - `OutgoingPacket.priority` наследуется от входящего запроса; ответ на priority-запрос идёт через priority-очередь OUTLINK.
 - `TransportManager` резолвит endpoint:
   1. `ConnectionCache::send(module, frame)`.
@@ -146,7 +149,11 @@ PacketHandler
 
 ```text
 start(module)
-  -> TDB::init
+  -> ConnectionCache::clear()
+  -> LinkManager::set_local_module(module)
+  -> server_api::register_module(module, endpoint)
+  -> TDB с RPC-хуком Core
+  -> TDB::init и TDB::set_handler(loom_packet_handler)
      -> UPLINK::init(workers, queue_capacity, strategy, max_direct_workers)
         -> обычный и priority Buffer
         -> пул Worker
@@ -155,11 +162,9 @@ start(module)
   -> TransportManager
   -> зарегистрировать UdsTransport
   -> set_tdb (Link reader -> TDB)
-  -> start_all
   -> TDB::set_sender(TransportManager::send_outgoing)
-  -> server_api::register_module(module, endpoint)
-  -> LinkManager::set_local_module(module)
-  -> ConnectionCache::clear()
+  -> PendingCalls::start()
+  -> TransportManager::start_all()
 ```
 
 Остановка:
@@ -173,9 +178,12 @@ stop()
         -> close fd
      -> LinkManager::set_incoming_sink(nullptr)
      -> LinkManager::close_all()
+  -> PendingCalls::shutdown()
   -> TDB::shutdown()
      -> UPLINK::shutdown()
      -> OUTLINK::shutdown()
+  -> уничтожение TransportManager
+  -> финальная очистка LinkManager
   -> ConnectionCache::clear()
   -> server_api::unregister_module(module)
   -> g_running = false
@@ -185,11 +193,12 @@ stop()
 
 - Сначала перестать принимать новые пакеты, затем дочитывать TDB.
 - Link reader'ы нужно остановить до `TDB::shutdown()`, иначе поток может обратиться к уничтоженному TDB.
+- `PendingCalls::shutdown()` закрывает приём новых ожиданий и будит текущие с ошибкой. Это делается перед остановкой воркеров.
 - Входящие fd закрываются только после join соответствующих client-loop потоков, чтобы `close()` не гонялся с `recv()`.
 - Диспетчер останавливается после опустошения `Buffer`, но до воркеров: он должен успеть раздать остаток.
 - Воркеры останавливаются после диспетчера: они дочитывают свой слот.
 - Уничтожать `TransportManager` только после того, как TDB дочитан.
-- Закрывать LinkManager и ConnectionCache только после TDB и TransportManager.
+- Финальная очистка LinkManager и ConnectionCache идёт после TDB и TransportManager.
 - `stop()` снимает модуль с регистрации в имитации ядра.
 
 ---
@@ -205,7 +214,7 @@ stop()
 - Не блокировать транспорт, пока все воркеры заняты: пакет остаётся в `Buffer` или отбрасывается.
 - Не использовать одну общую условную переменную для слотов всех воркеров.
 - Не возвращать старую модель, где все воркеры делают `pop` из общей очереди.
-- Не парсить GWP в транспорте.
+- Транспорт использует заголовок GWP только для чтения границ кадра.
 - Не резолвить `module -> endpoint` в транспорте.
 - Не передавать fd входящего соединения в TDB; `client_fd` всегда `-1`.
 - Не отдавать fd бизнес-логике: ответ может идти по принятому fd только через `ConnectionCache`.
@@ -213,6 +222,8 @@ stop()
 - Не считать, что Cache всегда заполнен; при промахе обязателен запрос к ядру.
 - Не менять порядок остановки.
 - Не класть `module_name`, `endpoint` или `fd` в GWP.
+- Хранить `reply_to` в RPC-конверте внутри `data`. В RPC-реестре использовать `worker_handle` и `call_seq`.
+- Обрабатывать `RESPONSE` на входе в TDB до `Buffer`. Хук завершает ожидание, а пользовательские методы выполняются в `PacketHandler` воркера.
 - Не помещать бизнес-логику в Worker; использовать `PacketHandler`.
 - Не включать старую стратегию, которая выбирает воркера в обход диспетчера.
 - Не помещать `LinkManager` или `ConnectionCache` внутрь TDB, Worker, OUTLINK или TransportManager.
@@ -233,8 +244,8 @@ stop()
 - `server_api::locate` — файловая имитация ядра, а не реальный запрос.
 - Имитация ядра не имеет heartbeat, TTL и авторизации.
 - UDS-handshake передаёт имя модуля и priority-флаг, но не проверяет имя и не аутентифицирует.
-- Кодек `rpc_codec` поддерживает только `int`, `double`, `float`, `bool`, `string`, `void`; формат host-endian и не версионирован.
-- `loom_call` синхронный; вложенный вызов из обработчика занимает воркер на всё время ожидания ответа.
+- Значения `int`, `double`, `float`, `bool`, `string`, `void` кодируются в формате хоста. Метаданные `reply_to` используют big-endian и версию `LRP/1`. Синхронный RPC требует поддержку этой версии у обоих модулей.
+- `loom_call` синхронный. Вложенный вызов занимает воркер на время ожидания. Готовый ответ доставляется вне пула.
 - `module_send` — это вызов метода `message` с одним строковым аргументом, а не произвольный payload.
 - `LinkManager` поддерживает только UDS.
 - Фоновый поток очистки для `prune_idle()` и `ConnectionCache` не запущен.
@@ -249,9 +260,9 @@ stop()
 | Путь | Роль |
 |---|---|
 | `src/core/loom.cpp` | Жизненный цикл, сборка компонентов, PacketHandler, `loom_call` |
-| `src/core/rpc_codec.*` | Кодек аргументов/результата RPC |
-| `src/core/rpc_state.*` | Ожидающие RPC-вызовы: packet_id → response |
-| `src/gateway/TDB/tdb.*` | Композиция UPLINK + OUTLINK |
+| `src/core/rpc_codec.*` | RPC-конверт с `reply_to`, кодек аргументов и результата |
+| `src/core/rpc_state.*` | Входной хук Core, реестр ожиданий и проверка `call_seq` |
+| `src/gateway/TDB/tdb.*` | Входной хук перед UPLINK, композиция UPLINK и OUTLINK |
 | `src/gateway/TDB/uplink/uplink.*` | Входной Buffer + диспетчер + пул воркеров |
 | `src/gateway/TDB/strategy/strategy.*` | `DistributionStrategy`, `RoundRobinStrategy` |
 | `src/gateway/TDB/worker/worker.*` | Один слот задачи, GWP-разбор, `PacketHandler` |
@@ -271,7 +282,7 @@ stop()
 | `brutal_tester/tests/test_tdb.cpp` | Тесты Buffer, диспетчера, стратегии, воркеров, priority-воркеров |
 | `brutal_tester/tests/test_transport.cpp` | Тесты транспорта, LinkManager и переиспользования входящих соединений |
 | `brutal_tester/tests/test_connect.cpp` | Тесты резолва, реестра имитации ядра и handshake |
-| `brutal_tester/tests/test_rpc.cpp` | Сквозной тест: два модуля, `loom_call`, TDB, ответ, priority |
+| `brutal_tester/tests/test_rpc.cpp` | Сквозной тест двух модулей и тест ответа при занятом воркере с отбрасыванием запоздалого `call_seq` |
 | `examples/calc_server.cpp` | Пример модуля-сервера |
 | `examples/calc_client.cpp` | Пример модуля-клиента |
 

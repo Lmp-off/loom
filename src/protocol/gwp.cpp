@@ -1,8 +1,14 @@
 #include "gwp.h"
 #include <arpa/inet.h>
+#include <atomic>
 #include <cstring>
 
 namespace gwp {
+
+uint32_t next_packet_id() {
+    static std::atomic<uint32_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 void GWPPacket::set_method(const std::string& method) {
     method_name_ = method;

@@ -298,7 +298,7 @@ int test_inbound_connection_reuse() {
             OutgoingPacket response;
             response.module = incoming.client_address;
             response.transport_type = incoming.transport_type;
-            response.data = make_frame(packet.get_id(),
+            response.data = make_frame(gwp::next_packet_id(),
                                        gwp::PacketType::RESPONSE,
                                        "pong",
                                        "ok");

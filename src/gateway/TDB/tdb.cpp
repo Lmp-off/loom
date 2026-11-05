@@ -4,7 +4,8 @@
 
 #include <utility>
 
-TDB::TDB() = default;
+TDB::TDB(IngressHandler ingress_handler)
+    : ingress_handler_(std::move(ingress_handler)) {}
 
 TDB::~TDB() {
     shutdown();
@@ -56,6 +57,7 @@ void TDB::pass_packet(IncomingPacket&& ip) {
         METALOG_WARNING("TDB: pass_packet before init, packet dropped");
         return;
     }
+    if (ingress_handler_ && ingress_handler_(ip)) return;
     uplink_->push(std::move(ip));
 }
 

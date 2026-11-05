@@ -69,7 +69,7 @@ enum class StatusCode : uint8_t {
 // Порядок полей не менять без новой версии протокола.
 struct GWPHeader {
     uint32_t magic;          // 0x4757505F ("GWP_"), проверяется первым
-    uint32_t packet_id;      // уникальный ID пакета
+    uint32_t packet_id;      // ID исходящего кадра в пределах процесса
     PacketType type;         // тип пакета
     uint8_t status;          // статус (для RESPONSE), иначе 0
     uint32_t method_name_len;// длина имени метода в байтах
@@ -79,6 +79,8 @@ struct GWPHeader {
 constexpr size_t HEADER_SIZE = sizeof(GWPHeader);
 constexpr uint32_t MAX_METHOD_LEN = 4096;
 constexpr uint32_t MAX_DATA_LEN = 16 * 1024 * 1024;
+
+uint32_t next_packet_id();
 
 // Читает и валидирует заголовок кадра, не копируя payload.
 // На выходе поля в host-byte-order. Возвращает false при неверном magic,

@@ -385,6 +385,7 @@ int test_outlink_failure() {
 }
 
 int test_worker_outgoing_chain() {
+    constexpr uint32_t response_id = 43;
     TDB tdb;
     if (!tdb.init(1, 1, 16)) return 1;
 
@@ -402,7 +403,7 @@ int test_worker_outgoing_chain() {
                        const OutgoingSink& sink) {
         gwp::GWPPacket response;
         response.set_type(gwp::PacketType::RESPONSE);
-        response.set_id(request.get_id());
+        response.set_id(response_id);
         response.set_method(request.get_method());
         const std::string body = "ok";
         response.set_data(body.data(), body.size());
@@ -440,7 +441,7 @@ int test_worker_outgoing_chain() {
         return 4;
     }
     if (response.get_type() != gwp::PacketType::RESPONSE) return 5;
-    if (response.get_id() != 42) return 6;
+    if (response.get_id() != response_id) return 6;
     if (response.get_method() != "process") return 7;
     if (response.get_data_size() != 2) return 8;
 

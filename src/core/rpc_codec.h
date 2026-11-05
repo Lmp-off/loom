@@ -7,10 +7,32 @@
 
 // Минимальный кодек аргументов и результата для RPC поверх GWP.
 //
-// Формат намеренно простой: числовые типы копируются как есть, строка
-// кодируется как [uint32 length][bytes]. Этого достаточно для UDS внутри
-// одной машины. При выходе на сеть формат нужно версионировать.
+// Значения числовых типов копируются как есть, строка кодируется как
+// [uint32 length][bytes]. Метаданные ответа имеют отдельный формат.
 namespace loom_rpc {
+
+struct ReplyTo {
+    uint64_t worker_handle = 0;
+    uint64_t call_seq = 0;
+
+    bool valid() const { return worker_handle != 0 && call_seq != 0; }
+};
+
+constexpr size_t REPLY_ENVELOPE_HEADER_SIZE =
+    sizeof(uint32_t) + 2 * sizeof(uint64_t);
+
+struct ReplyEnvelope {
+    ReplyTo reply_to;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+};
+
+// REQUEST и RESPONSE используют этот конверт в поле data GWP.
+// ASYNC_DATA содержит только аргументы.
+std::string encode_reply_envelope(ReplyTo reply_to,
+                                  const std::vector<uint8_t>& payload);
+bool decode_reply_envelope(const uint8_t* data, size_t size,
+                           ReplyEnvelope& envelope);
 
 // Приводит имена типов к каноническому виду (как в JIT-адаптерах):
 // string/str -> string, остальные — как есть.

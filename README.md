@@ -25,6 +25,7 @@
 - [Архитектура](#-архитектура)
 - [Компоненты](#-компоненты)
   - [GWP — Wire Protocol](#-gwp--wire-protocol)
+  - [RPC — запрос и ответ](#rpc--запрос-и-ответ)
   - [TDB — Task Distribution Block](#-tdb--task-distribution-block)
   - [Brutal Tester](#-brutal-tester)
 - [Установка](#-установка)
@@ -102,7 +103,7 @@ RPC Manager         █████░░░░░  50%
 | 10 | **Brutal Tester** | `75%` | 9 групп тестов, фильтры, тайминги; нет ассертов и unit-фреймворка |
 | 11 | **CMake** | `85%` | Подключены TDB, transport, protocol; нет export/package config |
 | 12 | **UDP-транспорт** | `40%` | Приём пакетов, протокол, интеграция с GWP |
-| 13 | **RPC Manager** | `50%` | Минимальный синхронный `call`/response через `rpc_state` + `rpc_codec`; отдельный `worker/rpc_manager` пока не используется |
+| 13 | **RPC Manager** | `50%` | Синхронный `loom_call`, `reply_to` в RPC-конверте и завершение вызова до буфера TDB |
 | 14 | **Server Core (имитация)** | `35%` | Файловый реестр `module -> endpoint/priority` с `flock`, переживает границы процессов; нет heartbeat, TTL и авторизации |
 
 ### 📋 Не начато
@@ -196,43 +197,15 @@ cmake -S . -B build && cmake --build build -j
 
 ## 🏗️ Архитектура
 
-```
-┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-│   Модуль A   │          │   Модуль B   │          │   Модуль C   │
-│  (процесс 1) │          │  (процесс 2) │          │  (процесс 3) │
-└──────┬───────┘          └──────┬───────┘          └──────┬───────┘
-       │                         │                         │
-       └─────────────┬───────────┴─────────────┬───────────┘
-                     │                         │
-              ┌──────▼──────┐           ┌──────▼──────┐
-              │   Discovery │           │  Transport  │
-              │  (cache)    │           │  UDS / UDP  │
-              └─────────────┘           └──────┬──────┘
-                                               │
-                                        ┌──────▼──────┐
-                                        │     GWP     │
-                                        │  Wire Proto │
-                                        └──────┬──────┘
-                                               │
-                                        ┌──────▼────────────┐
-                                        │       TDB         │
-                                        │  ┌────────────┐   │
-                                        │  │   Buffer   │   │
-                                        │  │ (overload) │   │
-                                        │  └─────┬──────┘   │
-                                        │  ┌─────▼──────┐   │
-                                        │  │   UPLINK   │   │
-                                        │  │ dispatcher │   │
-                                        │  └─────┬──────┘   │
-                                        │  ┌─────▼──────┐   │
-                                        │  │  Workers   │   │
-                                        │  └────────────┘   │
-                                        └──────┬────────────┘
-                                               │
-                                        ┌──────▼──────────┐
-                                        │  JIT Adapters   │
-                                        │  +  Registry    │
-                                        └─────────────────┘
+```mermaid
+flowchart TD
+    Transport["Транспорт UDS"] --> Ingress["Вход TDB"]
+    Ingress --> Hook["RPC-хук Core"]
+    Hook -->|RESPONSE| Pending["Ожидающий поток"]
+    Hook -->|"REQUEST / ASYNC_DATA"| Uplink["Buffer и диспетчер UPLINK"]
+    Uplink --> Worker["Worker и обработчик метода"]
+    Worker -->|Ответ| Outlink["OUTLINK"]
+    Outlink --> Transport
 ```
 
 ### Ключевые компоненты
@@ -244,6 +217,7 @@ cmake -S . -B build && cmake --build build -j
 | 🚚 **Transport** | UDS для локальной связи, UDP для сетевой |
 | 📦 **GWP** | Бинарный wire-протокол: header, типы пакетов, статусы |
 | ⚙️ **TDB** | Приём, общая буферизация и распределение входящих задач между воркерами |
+| **RPC Core** | Кодирует `reply_to` и доставляет ответы ожидающим потокам на входе в TDB |
 | ⚡ **JIT-адаптеры** | Генерация C++ обёрток для **приёма** вызовов по строковой сигнатуре |
 | 📋 **ModuleRegistry** | Хранит методы модуля + адаптеры, вызывает их |
 | 🔌 **LinkManager** | Пул исходящих соединений: переиспользует UDS fd между отправками |
@@ -279,7 +253,7 @@ cmake -S . -B build && cmake --build build -j
 ```c
 struct GWPHeader {
     uint32_t   magic;           // 0x4757505F ("GWP_")
-    uint32_t   packet_id;       // ID для корреляции запрос-ответ
+    uint32_t   packet_id;       // ID исходящего кадра в пределах процесса
     PacketType type;            // REQUEST / RESPONSE / ASYNC_DATA / HEARTBEAT / CLOSE
     uint8_t    status;          // OK / ERROR / METHOD_NOT_FOUND / TIMEOUT / INVALID_PARAMS
     uint32_t   method_name_len;
@@ -307,6 +281,28 @@ struct GWPHeader {
 
 **Что осталось:** версионирование, стриминг больших payload'ов, сжатие, handshake.
 
+### RPC — запрос и ответ
+
+У синхронных `REQUEST` и `RESPONSE` поле `data` содержит RPC-конверт.
+Его 20-байтный заголовок начинается с четырёхбайтовой метки `LRP/1`,
+за которой идут два 64-битных поля `worker_handle` и `call_seq` в big-endian.
+Дальше идут аргументы запроса или результат. Для `ASYNC_DATA` передаются
+только аргументы.
+
+1. `loom_call()` регистрирует объект ожидания перед отправкой. Пара
+   `reply_to` состоит из дескриптора вызывающего потока и номера его
+   вызова. Это работает из воркера TDB и из потока приложения.
+2. Модуль-получатель выполняет метод и возвращает ту же пару в ответе.
+   При формировании запроса и ответа `packet_id` выделяется независимо.
+3. На входе в TDB хук Core перехватывает `RESPONSE` перед `UPLINK`.
+   `PendingCalls::try_complete()` находит ожидание по `worker_handle`,
+   сверяет `call_seq` под мьютексом и будит вызывающий поток.
+   Просроченный или повторный ответ отбрасывается.
+
+Вложенный `loom_call()` занимает воркер до ответа или тайм-аута.
+Пришедший ответ можно доставить даже при полностью занятом пуле.
+Для синхронного RPC оба модуля должны поддерживать конверт `LRP/1`.
+
 ---
 
 ### ⚙️ TDB — Task Distribution Block
@@ -325,7 +321,7 @@ struct GWPHeader {
 
 | Подкомпонент | Статус | Описание |
 |:---|:---:|:---|
-| **Buffer** | ✅ Реализован | Входной ограниченный MPMC-буфер перегрузки на алгоритме Vyukov; `push` из транспорта, `pop` только диспетчером |
+| **Buffer** | ✅ Реализован | Ограниченный MPMC-буфер перегрузки на алгоритме Vyukov. TDB передаёт в него задачи после входного хука, диспетчер читает их через `pop` |
 | **Priority Buffer** | ✅ Реализован | Отдельный буфер для direct-трафика; диспетчер всегда вычитывает его первым |
 | **UPLINK** | ✅ Реализован | Входные Buffer'ы + `DistributionStrategy` + поток диспетчера + пул воркеров; воркеры не читают Buffer |
 | **Direct Workers** | ✅ Реализован | Лениво создаваемый выделенный Worker на priority-модуль, пока не исчерпан `max_direct_workers` |
@@ -360,6 +356,8 @@ class UPLINK {
 };
 
 class TDB {
+    using IngressHandler = std::function<bool(const IncomingPacket&)>;
+    explicit TDB(IngressHandler ingress_handler = {});
     bool init(size_t workers, size_t senders, size_t queue_capacity = 1024,
               std::unique_ptr<DistributionStrategy> strategy = nullptr,
               size_t max_direct_workers = UPLINK::kAutoDirectWorkers);
@@ -377,7 +375,8 @@ class TDB {
 первым. Это даёт ускорение без изменения базовой архитектуры
 Buffer → UPLINK → Worker.
 
-Обеспечивает **изоляцию транспорта от обработки**: транспорт кладёт пакеты во входной Buffer, диспетчер раздаёт их свободным воркерам, а воркеры не читают Buffer.
+Транспорт передаёт кадры в TDB. Хук Core обрабатывает ответы, а диспетчер
+раздаёт задачи из входного `Buffer` свободным воркерам.
 
 ---
 
@@ -409,7 +408,7 @@ Buffer → UPLINK → Worker.
 `use_module_direct(name, bool)` (C++) помечают модуль как direct/priority.
 
 - Handshake нового соединения несёт флаг priority (`src/transport/handshake.hpp`).
-- Принимающая сторона помечает `IncomingPacket::priority` и кладёт пакет в priority Buffer.
+- Принимающая сторона помечает `IncomingPacket::priority`. Запросы с этим флагом идут в priority Buffer.
 - Для priority-модуля UPLINK лениво создаёт выделенный Worker, пока не исчерпан `max_direct_workers`.
 - Если выделенного Worker нет, задачу берёт общий пул; диспетчер всё равно сначала разбирает priority Buffer.
 - Ответ наследует priority и отправляется через priority-очередь OUTLINK.
@@ -441,7 +440,7 @@ Buffer → UPLINK → Worker.
 | `send_recv` | Полный цикл: кэш → listener → send → stop |
 | `tdb` | Buffer MPMC, диспетчер и стратегия, один слот воркера, GWP-разбор, OUTLINK, handler, priority-воркеры и fallback |
 | `transport` | `TransportManager`, резолв Cache/ядра, `LinkManager`, UDS roundtrip, переиспользование входящего соединения |
-| `rpc` | Сквозной вызов между двумя процессами, `loom_call`, priority/direct режим |
+| `rpc` | Сквозной вызов между двумя процессами, `loom_call`, priority/direct режим и доставка вложенного ответа при занятом воркере с отбрасыванием старого `call_seq` |
 
 Каждый тест возвращает `int` (`0` = успех), раннер замеряет длительность и выводит сводку.
 

@@ -1,7 +1,10 @@
 #include "../../include/loom.h"
 
+#include "../../src/core/rpc_state.h"
 #include "../../src/core/server_core_api.h"
 #include "../../src/discovery/cache.h"
+#include "../../src/gateway/TDB/tdb.hpp"
+#include "../../src/protocol/gwp.h"
 #include "../../src/transport/connection_cache.hpp"
 #include "../../src/transport/link.hpp"
 
@@ -10,8 +13,10 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -76,7 +81,88 @@ bool wait_child(pid_t pid, int timeout_ms, int& status) {
     return false;
 }
 
+IncomingPacket make_reply(loom_rpc::ReplyTo reply_to, uint8_t value) {
+    const std::string body = loom_rpc::encode_reply_envelope(reply_to, {value});
+    gwp::GWPPacket response;
+    response.set_type(gwp::PacketType::RESPONSE);
+    response.set_id(gwp::next_packet_id());
+    response.set_method("nested");
+    response.set_data(body.data(), body.size());
+    IncomingPacket packet;
+    packet.data = response.make_package();
+    return packet;
+}
+
 } // namespace
+
+int test_rpc_ingress() {
+    using namespace std::chrono_literals;
+    struct Calls {
+        loom_rpc::ReplyTo expired;
+        loom_rpc::ReplyTo current;
+    };
+
+    std::promise<Calls> calls;
+    std::promise<bool> completed;
+    auto tokens = calls.get_future();
+    auto result = completed.get_future();
+    auto& pending = loom_rpc::pending_calls();
+
+    TDB tdb(loom_rpc::receive_response);
+    if (!tdb.init(1, 1)) return 1;
+    pending.start();
+
+    tdb.set_handler([&](const IncomingPacket&, gwp::GWPPacket& packet,
+                        const OutgoingSink&) {
+        if (packet.get_type() != gwp::PacketType::REQUEST) return;
+
+        loom_rpc::ReplyTo expired;
+        loom_rpc::Result reply;
+        {
+            loom_rpc::PendingCall first(pending);
+            expired = first.reply_to();
+            if (first.wait(reply, 1)) {
+                calls.set_value({});
+                return;
+            }
+        }
+
+        loom_rpc::PendingCall current(pending);
+        calls.set_value({expired, current.reply_to()});
+        completed.set_value(current.wait(reply, 2000) &&
+                            reply.data == std::vector<uint8_t>{43});
+    });
+
+    // Единственный воркер занимает слот, пока ждёт вложенный ответ.
+    gwp::GWPPacket request;
+    request.set_type(gwp::PacketType::REQUEST);
+    IncomingPacket packet;
+    packet.data = request.make_package();
+    tdb.pass_packet(std::move(packet));
+
+    int failure = 0;
+    if (tokens.wait_for(3s) != std::future_status::ready) {
+        failure = 2;
+    } else {
+        const Calls active = tokens.get();
+        if (!active.expired.valid() || !active.current.valid() ||
+            active.expired.worker_handle != active.current.worker_handle ||
+            active.expired.call_seq == active.current.call_seq) {
+            failure = 3;
+        } else {
+            tdb.pass_packet(make_reply(active.expired, 42));
+            tdb.pass_packet(make_reply(active.current, 43));
+            if (result.wait_for(3s) != std::future_status::ready || !result.get() ||
+                tdb.processed_count() != 1) {
+                failure = 4;
+            }
+        }
+    }
+
+    pending.shutdown();
+    tdb.shutdown();
+    return failure;
+}
 
 int test_rpc_all() {
     unlink(kServerSocket);

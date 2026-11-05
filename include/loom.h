@@ -11,7 +11,8 @@
 // - register_method() добавляет метод в ModuleRegistry;
 // - loom_call()/module_send() уходят в TransportManager: ConnectionCache ->
 //   Cache -> ядро -> LinkManager;
-// - входящие кадры проходят Transport -> TDB -> Worker -> PacketHandler;
+// - запросы идут через TDB к Worker, ответы обрабатывает RPC-хук Core
+//   на входе в TDB;
 // - use_module_direct_priority() включает direct/priority путь;
 // - C++-обёртка loom::call<R>() над loom_call() находится ниже.
 //

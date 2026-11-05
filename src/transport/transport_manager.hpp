@@ -3,7 +3,6 @@
 #include "transport.h"
 #include "../gateway/TDB/buffer/buffer.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -39,8 +38,7 @@ public:
 
     int send_request(const std::string& module,
                      const std::string& method,
-                     const std::string& data,
-                     uint32_t packet_id = 0);
+                     const std::string& data);
     int send_async(const std::string& module,
                    const std::string& method,
                    const std::string& data);
@@ -57,11 +55,9 @@ private:
     int send_packet(const std::string& module,
                     const std::string& method,
                     const std::string& data,
-                    uint32_t packet_id,
                     bool async);
 
     mutable std::mutex mutex_;
     std::map<connection_type, std::unique_ptr<Transport>> by_type_;
     TDB* tdb_ = nullptr;
-    std::atomic<uint32_t> next_packet_id_{1};
 };

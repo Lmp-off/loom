@@ -85,21 +85,19 @@ void TransportManager::stop_all() {
 
 int TransportManager::send_request(const std::string& module,
                                    const std::string& method,
-                                   const std::string& data,
-                                   uint32_t packet_id) {
-    return send_packet(module, method, data, packet_id, false);
+                                   const std::string& data) {
+    return send_packet(module, method, data, false);
 }
 
 int TransportManager::send_async(const std::string& module,
                                  const std::string& method,
                                  const std::string& data) {
-    return send_packet(module, method, data, 0, true);
+    return send_packet(module, method, data, true);
 }
 
 int TransportManager::send_packet(const std::string& module,
                                   const std::string& method,
                                   const std::string& data,
-                                  uint32_t packet_id,
                                   bool async) {
     if (module.empty()) {
         METALOG_ERROR("TransportManager: request has no module");
@@ -109,10 +107,7 @@ int TransportManager::send_packet(const std::string& module,
     gwp::GWPPacket packet;
     packet.set_type(async ? gwp::PacketType::ASYNC_DATA
                           : gwp::PacketType::REQUEST);
-    packet.set_id(packet_id != 0
-                      ? packet_id
-                      : next_packet_id_.fetch_add(1,
-                                                  std::memory_order_relaxed));
+    packet.set_id(gwp::next_packet_id());
     packet.set_method(method);
     packet.set_data(data.empty() ? nullptr : data.data(), data.size());
 

@@ -5,13 +5,14 @@
 #include "uplink/uplink.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 
 // TDB — Task Distribution Block, композиция UPLINK и OUTLINK.
 //
 // Архитектурные инварианты:
-// - входящий путь: Transport -> pass_packet() -> UPLINK::push -> Buffer ->
-//   диспетчер -> Worker -> PacketHandler;
+// - входящий путь: Transport -> pass_packet() -> IngressHandler;
+//   кадры, оставленные хуком, идут в UPLINK::push -> Buffer -> Worker;
 // - исходящий путь: PacketHandler -> OutgoingSink -> submit_outgoing() ->
 //   OUTLINK -> SendCallback -> TransportManager;
 // - TDB не знает про транспорт, Cache и GWP-семантику;
@@ -24,7 +25,10 @@
 
 class TDB {
 public:
-    TDB();
+    // true: кадр обработан на входе. false: передать его в UPLINK.
+    using IngressHandler = std::function<bool(const IncomingPacket&)>;
+
+    explicit TDB(IngressHandler ingress_handler = {});
     ~TDB();
 
     TDB(const TDB&) = delete;
@@ -48,6 +52,7 @@ public:
     size_t dropped_count() const;
 
 private:
+    const IngressHandler ingress_handler_;
     std::unique_ptr<UPLINK> uplink_;
     std::unique_ptr<OUTLINK> outlink_;
 };
