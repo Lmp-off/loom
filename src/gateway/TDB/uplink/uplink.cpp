@@ -28,12 +28,6 @@ bool UPLINK::init(size_t workers, size_t queue_capacity,
         return false;
     }
 
-    if (!priority_buffer_.init(queue_capacity)) {
-        METALOG_ERROR("UPLINK: failed to init priority buffer");
-        buffer_.shutdown();
-        return false;
-    }
-
     max_direct_workers_ =
         (max_direct_workers == kAutoDirectWorkers) ? workers
                                                    : max_direct_workers;
@@ -95,7 +89,11 @@ void UPLINK::shutdown() {
     }
 
     buffer_.shutdown();
-    priority_buffer_.shutdown();
+    {
+        std::lock_guard<std::mutex> lock(priority_mutex_);
+        priority_buffers_.clear();
+        next_priority_ = priority_buffers_.end();
+    }
     strategy_.reset();
 
     {
@@ -117,12 +115,12 @@ void UPLINK::push(IncomingPacket&& packet) {
     }
 
     const bool priority = packet.priority;
-    Buffer& target = priority ? priority_buffer_ : buffer_;
-
-    if (!target.push(std::move(packet))) {
+    const bool queued = priority ? push_priority(std::move(packet))
+                                 : buffer_.push(std::move(packet));
+    if (!queued) {
         dropped_.fetch_add(1, std::memory_order_relaxed);
         METALOG_WARNING(priority
-                            ? "UPLINK: priority buffer is full, packet dropped"
+                            ? "UPLINK: priority packet could not be queued"
                             : "UPLINK: ingress buffer is full, packet dropped");
         return;
     }
@@ -130,39 +128,56 @@ void UPLINK::push(IncomingPacket&& packet) {
     dispatcher_wake_.notify_one();
 }
 
-bool UPLINK::pop_next(IncomingPacket& packet) {
-    // Direct/priority трафик всегда разбирается первым.
-    if (priority_buffer_.pop(packet)) return true;
-    return buffer_.pop(packet);
+bool UPLINK::push_priority(IncomingPacket&& packet) {
+    std::lock_guard<std::mutex> lock(priority_mutex_);
+    if (packet.connection.expired()) return false;
+
+    auto it = priority_buffers_.find(packet.connection);
+    if (it == priority_buffers_.end()) {
+        auto buffer = std::make_unique<Buffer>();
+        if (!buffer->init(buffer_.capacity())) return false;
+        it = priority_buffers_.emplace(packet.connection, std::move(buffer)).first;
+    }
+    return it->second->push(std::move(packet));
 }
 
-void UPLINK::dispatch_packet(IncomingPacket&& packet) {
-    const bool priority = packet.priority;
-    const std::string module = packet.client_address;
-
-    while (true) {
-        if (priority) {
-            Worker* dedicated = ensure_direct_worker(module);
-            if (dedicated != nullptr &&
-                dedicated->try_submit(std::move(packet))) {
-                dispatched_.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+bool UPLINK::dispatch_priority() {
+    std::unique_lock<std::mutex> lock(priority_mutex_);
+    for (size_t remaining = priority_buffers_.size(); remaining > 0; --remaining) {
+        if (next_priority_ == priority_buffers_.end()) {
+            next_priority_ = priority_buffers_.begin();
         }
+        const auto it = next_priority_++;
+        Buffer& buffer = *it->second;
 
-        const size_t index =
-            strategy_ ? strategy_->dispatch(packet, workers_)
-                      : DistributionStrategy::npos;
+        // Только диспетчер удаляет буферы. Стратегия работает вне мьютекса.
+        lock.unlock();
+        const bool dispatched = buffer.try_consume([this](IncomingPacket& packet) {
+            return submit(ensure_direct_worker(packet.client_address), packet) ||
+                   submit(choose_shared_worker(packet), packet);
+        });
+        lock.lock();
 
-        if (index < workers_.size() && workers_[index] &&
-            workers_[index]->try_submit(std::move(packet))) {
-            dispatched_.fetch_add(1, std::memory_order_relaxed);
-            return;
+        if (it->first.expired() && buffer.empty()) {
+            priority_buffers_.erase(it);
         }
-
-        std::unique_lock<std::mutex> lock(dispatcher_wake_.mutex);
-        dispatcher_wake_.cv.wait_for(lock, std::chrono::milliseconds(1));
+        if (dispatched) return true;
     }
+    return false;
+}
+
+Worker* UPLINK::choose_shared_worker(const IncomingPacket& packet) {
+    const size_t index = strategy_ ? strategy_->dispatch(packet, workers_)
+                                   : DistributionStrategy::npos;
+    return index < workers_.size() ? workers_[index].get() : nullptr;
+}
+
+bool UPLINK::submit(Worker* worker, IncomingPacket& packet) {
+    if (worker != nullptr && worker->try_submit(std::move(packet))) {
+        dispatched_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 Worker* UPLINK::ensure_direct_worker(const std::string& module) {
@@ -206,16 +221,27 @@ Worker* UPLINK::ensure_direct_worker(const std::string& module) {
 
 void UPLINK::dispatcher_loop() {
     while (true) {
-        IncomingPacket packet;
-        if (!pop_next(packet)) {
-            if (!running_.load(std::memory_order_acquire)) break;
+        if (dispatch_priority()) continue;
 
-            std::unique_lock<std::mutex> lock(dispatcher_wake_.mutex);
-            dispatcher_wake_.cv.wait_for(lock, std::chrono::milliseconds(1));
-            continue;
+        bool priority_dispatched = false;
+        const bool ordinary_dispatched =
+            buffer_.try_consume([&](IncomingPacket& packet) {
+                Worker* worker = choose_shared_worker(packet);
+                if (worker == nullptr) return false;
+
+                // Общий воркер мог освободиться после проверки priority-очередей.
+                // Перепроверяем их перед выдачей обычной задачи.
+                priority_dispatched = dispatch_priority();
+                return !priority_dispatched && submit(worker, packet);
+            });
+        if (ordinary_dispatched || priority_dispatched) continue;
+
+        if (!running_.load(std::memory_order_acquire) && buffer_.empty() &&
+            priority_queue_size() == 0) {
+            break;
         }
-
-        dispatch_packet(std::move(packet));
+        std::unique_lock<std::mutex> lock(dispatcher_wake_.mutex);
+        dispatcher_wake_.cv.wait_for(lock, std::chrono::milliseconds(1));
     }
 }
 
@@ -256,7 +282,12 @@ size_t UPLINK::queue_size() const {
 }
 
 size_t UPLINK::priority_queue_size() const {
-    return priority_buffer_.size();
+    std::lock_guard<std::mutex> lock(priority_mutex_);
+    size_t total = 0;
+    for (const auto& entry : priority_buffers_) {
+        total += entry.second->size();
+    }
+    return total;
 }
 
 size_t UPLINK::workers_count() const {

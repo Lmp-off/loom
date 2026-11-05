@@ -4,6 +4,7 @@
 #include "../../src/discovery/cache.h"
 #include "../../src/protocol/gwp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +40,18 @@ std::vector<uint8_t> make_frame(uint32_t id,
     packet.set_method(method);
     packet.set_data(payload.empty() ? nullptr : payload.data(), payload.size());
     return packet.make_package();
+}
+
+IncomingPacket make_ingress_packet(
+    uint32_t id, const std::string& module, const std::string& method,
+    const std::shared_ptr<const IngressConnection>& connection = {},
+    gwp::PacketType type = gwp::PacketType::REQUEST) {
+    IncomingPacket packet;
+    packet.data = make_frame(id, type, method, "x");
+    packet.client_address = module;
+    packet.priority = static_cast<bool>(connection);
+    packet.connection = connection;
+    return packet;
 }
 
 class CountingStrategy final : public DistributionStrategy {
@@ -477,15 +490,8 @@ int test_uplink_priority_dedicated_worker() {
         order.push_back(incoming.client_address);
     });
 
-    auto make = [](uint32_t id, const std::string& module, bool priority) {
-        IncomingPacket packet;
-        packet.data = make_frame(id, gwp::PacketType::REQUEST, "m", "x");
-        packet.client_address = module;
-        packet.priority = priority;
-        return packet;
-    };
-
-    tdb.pass_packet(make(1, "slow", false));
+    const auto connection = std::make_shared<IngressConnection>();
+    tdb.pass_packet(make_ingress_packet(1, "slow", "m"));
     if (!wait_until([&mutex, &slow_entered]() {
             std::lock_guard<std::mutex> lock(mutex);
             return slow_entered;
@@ -495,7 +501,7 @@ int test_uplink_priority_dedicated_worker() {
 
     // Пока единственный общий воркер занят, priority-пакет должен уйти
     // на выделенный Worker и обработаться сразу.
-    tdb.pass_packet(make(2, "fast", true));
+    tdb.pass_packet(make_ingress_packet(2, "fast", "m", connection));
     if (!wait_until([&mutex, &order]() {
             std::lock_guard<std::mutex> lock(mutex);
             return !order.empty();
@@ -553,15 +559,8 @@ int test_uplink_priority_shared_fallback() {
         order.push_back(incoming.client_address);
     });
 
-    auto make = [](uint32_t id, const std::string& module, bool priority) {
-        IncomingPacket packet;
-        packet.data = make_frame(id, gwp::PacketType::REQUEST, "m", "x");
-        packet.client_address = module;
-        packet.priority = priority;
-        return packet;
-    };
-
-    tdb.pass_packet(make(1, "slow", false));
+    const auto connection = std::make_shared<IngressConnection>();
+    tdb.pass_packet(make_ingress_packet(1, "slow", "m"));
     if (!wait_until([&mutex, &slow_entered]() {
             std::lock_guard<std::mutex> lock(mutex);
             return slow_entered;
@@ -569,8 +568,8 @@ int test_uplink_priority_shared_fallback() {
         return 2;
     }
 
-    tdb.pass_packet(make(2, "fast", true));
-    tdb.pass_packet(make(3, "normal", false));
+    tdb.pass_packet(make_ingress_packet(2, "fast", "m", connection));
+    tdb.pass_packet(make_ingress_packet(3, "normal", "m"));
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -597,6 +596,93 @@ int test_uplink_priority_shared_fallback() {
     if (tdb.uplink()->direct_workers_count() != 0) return 9;
 
     return 0;
+}
+
+int test_uplink_priority_connection_buffers() {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool common_started = false;
+    bool priority_started = false;
+    bool release_common = false;
+    bool release_priority = false;
+    std::vector<std::string> completed;
+
+    auto busy_connection = std::make_shared<IngressConnection>();
+    const auto same_peer_connection = std::make_shared<IngressConnection>();
+    const auto other_connection = std::make_shared<IngressConnection>();
+
+    TDB tdb;
+    if (!tdb.init(1, 1, 2, nullptr, 2)) return 1;
+    tdb.set_handler([&](const IncomingPacket&, gwp::GWPPacket& packet,
+                        const OutgoingSink&) {
+        const std::string method = packet.get_method();
+        std::unique_lock<std::mutex> lock(mutex);
+        if (method == "hold_common") {
+            common_started = true;
+            cv.wait(lock, [&] { return release_common; });
+        } else if (method == "hold_priority") {
+            priority_started = true;
+            cv.wait(lock, [&] { return release_priority; });
+        }
+        completed.push_back(method);
+    });
+
+    const auto started = [&](const bool& flag) {
+        return wait_until([&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            return flag;
+        });
+    };
+    const auto finished = [&](const std::string& method) {
+        return wait_until([&] {
+            std::lock_guard<std::mutex> lock(mutex);
+            return std::find(completed.begin(), completed.end(), method) != completed.end();
+        });
+    };
+    const int result = [&]() {
+        tdb.pass_packet(make_ingress_packet(1, "common", "hold_common"));
+        if (!started(common_started)) return 2;
+        tdb.pass_packet(make_ingress_packet(2, "common", "ordinary"));
+
+        tdb.pass_packet(make_ingress_packet(3, "A", "hold_priority", busy_connection));
+        if (!started(priority_started)) return 3;
+
+        tdb.pass_packet(make_ingress_packet(4, "A", "add", busy_connection,
+                                            gwp::PacketType::ASYNC_DATA));
+        tdb.pass_packet(make_ingress_packet(5, "A", "mul", busy_connection,
+                                            gwp::PacketType::ASYNC_DATA));
+        tdb.pass_packet(make_ingress_packet(6, "A", "overflow", busy_connection));
+        tdb.pass_packet(make_ingress_packet(7, "A", "second_socket", same_peer_connection));
+        tdb.pass_packet(make_ingress_packet(8, "C", "independent", other_connection));
+
+        if (!finished("independent") || tdb.dropped_count() != 1 ||
+            !wait_until([&] { return tdb.uplink()->priority_queue_size() == 3; })) {
+            return 4;
+        }
+
+        // Уже принятые задачи дочитываются после закрытия соединения.
+        busy_connection.reset();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            release_priority = true;
+        }
+        cv.notify_all();
+        if (!finished("mul") || !finished("second_socket")) return 5;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto add = std::find(completed.begin(), completed.end(), "add");
+        const auto mul = std::find(completed.begin(), completed.end(), "mul");
+        return add < mul ? 0 : 6;
+    }();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_common = true;
+        release_priority = true;
+    }
+    cv.notify_all();
+    tdb.shutdown();
+    return result;
 }
 
 } // namespace
@@ -634,6 +720,9 @@ int test_tdb_all() {
 
     result = test_uplink_priority_shared_fallback();
     if (result != 0) return 900 + result;
+
+    result = test_uplink_priority_connection_buffers();
+    if (result != 0) return 1000 + result;
 
     return 0;
 }

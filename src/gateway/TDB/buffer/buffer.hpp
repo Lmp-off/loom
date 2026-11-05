@@ -19,6 +19,9 @@
 // - ёмкость округляется вверх до степени двойки;
 // - при переполнении push возвращает false, пакет отбрасывается вызывающим.
 
+// Метка живого соединения. Читатель сокета владеет меткой до закрытия.
+struct IngressConnection {};
+
 struct IncomingPacket {
     std::vector<uint8_t> data;
     int client_fd = -1;
@@ -26,6 +29,7 @@ struct IncomingPacket {
     int client_port = 0;
     int transport_type = -1;
     bool priority = false;
+    std::weak_ptr<const IngressConnection> connection;
 };
 
 struct OutgoingPacket {
@@ -49,6 +53,10 @@ public:
 
     bool push(T&& packet);
     bool pop(T& packet);
+
+    // Для очереди с одним потребителем. consume перемещает пакет только при true.
+    template <typename Consumer>
+    bool try_consume(Consumer&& consume);
 
     size_t size() const;
     size_t capacity() const;
@@ -154,6 +162,23 @@ bool RingBuffer<T>::pop(T& packet) {
             pos = dequeue_pos_.load(std::memory_order_relaxed);
         }
     }
+}
+
+template <typename T>
+template <typename Consumer>
+bool RingBuffer<T>::try_consume(Consumer&& consume) {
+    if (!slots_) return false;
+
+    const size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+    Slot& slot = slots_[pos & mask_];
+    if (slot.seq.load(std::memory_order_acquire) != pos + 1 ||
+        !consume(slot.packet)) {
+        return false;
+    }
+
+    dequeue_pos_.store(pos + 1, std::memory_order_relaxed);
+    slot.seq.store(pos + capacity_, std::memory_order_release);
+    return true;
 }
 
 template <typename T>

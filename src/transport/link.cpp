@@ -88,6 +88,8 @@ Link::~Link() {
 void Link::reader_loop() {
     uint8_t header_buffer[gwp::HEADER_SIZE];
     std::vector<uint8_t> frame;
+    const auto ingress_connection =
+        priority_ ? std::make_shared<IngressConnection>() : nullptr;
 
     while (open_.load(std::memory_order_acquire)) {
         if (!recv_exact(fd_, header_buffer, sizeof(header_buffer))) break;
@@ -117,6 +119,7 @@ void Link::reader_loop() {
         packet.client_port = 0;
         packet.transport_type = static_cast<int>(CONNECTION_UDS);
         packet.priority = priority_;
+        packet.connection = ingress_connection;
 
         if (sink_) sink_(std::move(packet));
     }

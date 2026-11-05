@@ -17,7 +17,8 @@
 //   OUTLINK -> SendCallback -> TransportManager;
 // - TDB не знает про транспорт, Cache и GWP-семантику;
 // - client_fd входящего пакета всегда -1;
-// - priority-пакеты идут в priority Buffer и priority-очередь OUTLINK.
+// - priority-пакеты идут во входной Buffer своего соединения, а ответы
+//   уходят через priority-очередь OUTLINK.
 //
 // init(): workers — число воркеров UPLINK, senders — число потоков OUTLINK,
 // max_direct_workers — лимит выделенных воркеров priority-модулей

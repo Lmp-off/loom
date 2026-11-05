@@ -30,9 +30,9 @@ uint8_t stop(void);
 uint8_t use_module_direct(const char* module_name);
 
 // То же, но с явным режимом direct/priority.
-// priority != 0: пакеты модуля идут в приоритетную очередь TDB, а на
-// принимающей стороне для соединения создаётся выделенный Worker
-// (если лимит ресурсов позволяет).
+// priority != 0: принимающая сторона буферизует задачи отдельно для
+// каждого приоритетного соединения и выделяет Worker модулю-отправителю
+// при наличии свободного лимита.
 uint8_t use_module_direct_priority(const char* module_name, int priority);
 
 uint8_t use_module(const char* description, const char* as_name);

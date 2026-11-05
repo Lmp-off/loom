@@ -200,6 +200,9 @@ void UdsTransport::client_loop(int fd) {
         get_connection_cache().put_inbound(connection);
     }
 
+    const auto ingress_connection =
+        priority ? std::make_shared<IngressConnection>() : nullptr;
+
     // Одно соединение может нести несколько кадров: LinkManager
     // переиспользует fd, поэтому читаем в цикле до закрытия/ошибки.
     while (running_.load(std::memory_order_acquire)) {
@@ -236,6 +239,7 @@ void UdsTransport::client_loop(int fd) {
             packet.client_port = 0;
             packet.transport_type = static_cast<int>(CONNECTION_UDS);
             packet.priority = priority;
+            packet.connection = ingress_connection;
             tdb_->pass_packet(std::move(packet));
         } else {
             METALOG_WARNING("[UDS] TDB is not set, packet dropped");

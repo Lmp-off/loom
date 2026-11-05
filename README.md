@@ -99,7 +99,7 @@ RPC Manager         █████░░░░░  50%
 | № | Компонент | Готовность | Осталось |
 |:---:|:---|:---:|:---|
 | 8 | **GWP-протокол** | `45%` | Header, packet types, статусы, сериализация; нет версионирования и стриминга |
-| 9 | **TDB (Buffer + UPLINK + OUTLINK)** | `92%` | Входной буфер перегрузки + диспетчер/стратегия + пул воркеров, priority-очередь и выделенные direct-воркеры, GWP-разбор, handler → OUTLINK, адресация ответа через UDS-handshake |
+| 9 | **TDB (Buffer + UPLINK + OUTLINK)** | `92%` | Входные буферы перегрузки, диспетчер и пул воркеров, priority-буфер на соединение, выделенные direct-воркеры, GWP-разбор и OUTLINK |
 | 10 | **Brutal Tester** | `75%` | 9 групп тестов, фильтры, тайминги; нет ассертов и unit-фреймворка |
 | 11 | **CMake** | `85%` | Подключены TDB, transport, protocol; нет export/package config |
 | 12 | **UDP-транспорт** | `40%` | Приём пакетов, протокол, интеграция с GWP |
@@ -222,7 +222,7 @@ flowchart TD
 | 📋 **ModuleRegistry** | Хранит методы модуля + адаптеры, вызывает их |
 | 🔌 **LinkManager** | Пул исходящих соединений: переиспользует UDS fd между отправками |
 | ♻️ **ConnectionCache** | Реестр уже принятых входящих соединений по имени модуля: ответы и встречные запросы идут по тому же fd |
-| ⚡ **Priority path** | direct-модули: priority-очереди в UPLINK/OUTLINK + выделенный Worker на соединение, с fallback на общий пул |
+| ⚡ **Priority path** | Входной буфер на priority-соединение, выделенный Worker на модуль и fallback на общий пул |
 
 ---
 
@@ -321,8 +321,8 @@ struct GWPHeader {
 
 | Подкомпонент | Статус | Описание |
 |:---|:---:|:---|
-| **Buffer** | ✅ Реализован | Ограниченный MPMC-буфер перегрузки на алгоритме Vyukov. TDB передаёт в него задачи после входного хука, диспетчер читает их через `pop` |
-| **Priority Buffer** | ✅ Реализован | Отдельный буфер для direct-трафика; диспетчер всегда вычитывает его первым |
+| **Buffer** | ✅ Реализован | Ограниченный MPMC-буфер перегрузки. Диспетчер снимает задачу через `try_consume` после успешного назначения |
+| **Priority Buffer** | ✅ Реализован | Отдельный FIFO для каждого priority-соединения. Диспетчер проверяет их по кругу перед обычным буфером |
 | **UPLINK** | ✅ Реализован | Входные Buffer'ы + `DistributionStrategy` + поток диспетчера + пул воркеров; воркеры не читают Buffer |
 | **Direct Workers** | ✅ Реализован | Лениво создаваемый выделенный Worker на priority-модуль, пока не исчерпан `max_direct_workers` |
 | **Worker** | ✅ Реализован | Один слот задачи, `GWP::deserialize`, проверка кадра, счётчики, `PacketHandler` → `OutgoingSink` |
@@ -335,6 +335,8 @@ class RingBuffer<T> {
     bool init(size_t capacity);                   // округляет до степени двойки
     bool push(T&& packet);                        // false, если очередь полна
     bool pop(T& packet);                          // false, если очередь пуста
+    template <typename Consumer>
+    bool try_consume(Consumer&& consume);          // один потребитель
     size_t size() const;
     bool full() const;
 };
@@ -348,7 +350,7 @@ class UPLINK {
     bool init(size_t workers, size_t queue_capacity = 1024,
               std::unique_ptr<DistributionStrategy> strategy = nullptr,
               size_t max_direct_workers = kAutoDirectWorkers);
-    void push(IncomingPacket&& packet);           // priority -> priority Buffer
+    void push(IncomingPacket&& packet);           // priority -> буфер соединения
     size_t processed_count() const;
     size_t worker_processed(size_t index) const;
     size_t direct_workers_count() const;
@@ -368,12 +370,9 @@ class TDB {
 };
 ```
 
-`max_direct_workers == kAutoDirectWorkers` означает «столько же, сколько
-обычных воркеров»; `0` полностью отключает выделенные воркеры. Если
-выделенного воркера нет или он занят, priority-пакет берёт свободный
-воркер общего пула, но диспетчер всё равно разбирает priority Buffer
-первым. Это даёт ускорение без изменения базовой архитектуры
-Buffer → UPLINK → Worker.
+`max_direct_workers == kAutoDirectWorkers` задаёт столько же выделенных
+воркеров, сколько обычных. Значение `0` направляет priority-задачи в общий
+пул. При занятости выделенного воркера диспетчер пробует общий пул.
 
 Транспорт передаёт кадры в TDB. Хук Core обрабатывает ответы, а диспетчер
 раздаёт задачи из входного `Buffer` свободным воркерам.
@@ -408,9 +407,10 @@ Buffer → UPLINK → Worker.
 `use_module_direct(name, bool)` (C++) помечают модуль как direct/priority.
 
 - Handshake нового соединения несёт флаг priority (`src/transport/handshake.hpp`).
-- Принимающая сторона помечает `IncomingPacket::priority`. Запросы с этим флагом идут в priority Buffer.
+- Читатель UDS присваивает приоритетному соединению локальную метку. По ней UPLINK создаёт отдельный входной буфер с ёмкостью `queue_capacity`, округлённой до степени двойки.
+- Запросы и односторонние сообщения одного соединения назначаются в порядке поступления. Если задействован общий пул, методы могут завершиться в другом порядке.
 - Для priority-модуля UPLINK лениво создаёт выделенный Worker, пока не исчерпан `max_direct_workers`.
-- Если выделенного Worker нет, задачу берёт общий пул; диспетчер всё равно сначала разбирает priority Buffer.
+- Если ни выделенный, ни общий воркер пока не может взять задачу, она остаётся в буфере своего соединения. Диспетчер проверяет остальные буферы.
 - Ответ наследует priority и отправляется через priority-очередь OUTLINK.
 - Смена режима инвалидирует существующий `Link`, чтобы handshake был отправлен заново.
 
@@ -438,7 +438,7 @@ Buffer → UPLINK → Worker.
 | `jit` | Генерация адаптера + вызов `int,int->int` |
 | `connect` | `locate`, fallback, реестр имитации ядра, priority, handshake |
 | `send_recv` | Полный цикл: кэш → listener → send → stop |
-| `tdb` | Buffer MPMC, диспетчер и стратегия, один слот воркера, GWP-разбор, OUTLINK, handler, priority-воркеры и fallback |
+| `tdb` | Buffer MPMC, диспетчер и стратегия, слот воркера, OUTLINK, priority-воркеры, отдельные очереди соединений и fallback |
 | `transport` | `TransportManager`, резолв Cache/ядра, `LinkManager`, UDS roundtrip, переиспользование входящего соединения |
 | `rpc` | Сквозной вызов между двумя процессами, `loom_call`, priority/direct режим и доставка вложенного ответа при занятом воркере с отбрасыванием старого `call_seq` |
 

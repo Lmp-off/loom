@@ -19,9 +19,10 @@
 //
 // Архитектурные инварианты:
 // - Buffer — буфер перегрузки, а не очередь задач воркеров;
-// - единственный потребитель обоих Buffer — диспетчер UPLINK;
+// - единственный потребитель входных Buffer — диспетчер UPLINK;
 // - диспетчер выбирает воркера через DistributionStrategy;
-// - priority Buffer всегда вычитывается раньше обычного;
+// - каждое priority-соединение получает свой ограниченный Buffer;
+// - диспетчер обходит priority-буферы по кругу перед обычным Buffer;
 // - для priority-модуля создаётся выделенный Worker, пока не исчерпан
 //   max_direct_workers;
 // - если выделенного Worker нет или он занят, priority-пакет берёт свободный
@@ -69,12 +70,20 @@ public:
 
 private:
     void dispatcher_loop();
-    bool pop_next(IncomingPacket& packet);
-    void dispatch_packet(IncomingPacket&& packet);
+    bool push_priority(IncomingPacket&& packet);
+    bool dispatch_priority();
+    Worker* choose_shared_worker(const IncomingPacket& packet);
+    bool submit(Worker* worker, IncomingPacket& packet);
     Worker* ensure_direct_worker(const std::string& module);
 
     Buffer buffer_;
-    Buffer priority_buffer_;
+    using ConnectionKey = std::weak_ptr<const IngressConnection>;
+    using PriorityBuffers =
+        std::map<ConnectionKey, std::unique_ptr<Buffer>, std::owner_less<ConnectionKey>>;
+    mutable std::mutex priority_mutex_;
+    PriorityBuffers priority_buffers_;
+    PriorityBuffers::iterator next_priority_ = priority_buffers_.end();
+
     WakeChannel dispatcher_wake_;
     std::vector<std::unique_ptr<Worker>> workers_;
 
